@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.reference/
+.runtime/
+.pytest_cache/
+config/local.properties
+target/
+*.log
+dist/
+
