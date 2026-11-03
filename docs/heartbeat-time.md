@@ -41,4 +41,4 @@ FROM PUBLIC.HB_LATEST ORDER BY ELEVATOR_ID LIMIT 20;
 
 ## 验证结果
 
-2026-11-03在Java 11下执行 `mvn verify`：143项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate北京时间解析、空SendTime、两种时间顺序冲突、过期和未来边界、Flink状态恢复，以及真实Ignite事务/持久化测试。新增动态配置后台刷新、历史扩缩容、离线延迟清理、配置异常保留旧值、策略版本保护及调整历史时的事务回滚验证。最终JAR经独立Java进程验证写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS、内网Kafka/YARN及吞吐量仍需集群验收。
+2026-11-03在Java 11下执行 `mvn clean verify`：149项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate规则、Flink状态恢复、真实Ignite事务/持久化、动态配置后台刷新、历史扩缩容、离线延迟清理、策略版本保护及事务回滚。同步程序另验证只修改local.properties即可发布、版本自动管理、无效配置保护及凭据隔离；最终JAR经独立Java进程验证配置发布、数据库写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS发布和读取、内网Kafka/YARN及吞吐量仍需集群验收。

@@ -58,7 +58,7 @@ src/main/java/com/hitachi/yx2602/heartbeat/
   CreatedVersion.java           Flink保存的每梯业务时间和历史序号
 sql/ignite2-heartbeat.sql        手工建表脚本
 config/reader.example.properties
-config/heartbeat-history.properties  共享历史保留策略模板（version / max.records）
+bin/watch-history-config.sh     提交节点配置同步入口；共享策略文件由程序自动生成
 src/test/java/                  字段、时间、状态恢复、事务、背压、真实Flink/Ignite及打包测试
 ```
 
@@ -82,13 +82,13 @@ mvn -B -ntp clean verify
 
 测试中的本地Flink MiniCluster实际运行读取校验、解析、keyBy和侧输出；算子测试通过快照与恢复验证历史序号延续。测试不连接真实Kafka，不能替代Kafka断网、Broker重启、YARN恢复或性能压测。
 
-2026-11-03在Java 11下执行 `mvn verify`：143项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate北京时间解析、空SendTime、两种时间顺序冲突、过期和未来边界、Flink状态恢复，以及真实Ignite事务/持久化测试。新增动态配置后台刷新、历史扩缩容、离线延迟清理、配置异常保留旧值、策略版本保护及调整历史时的事务回滚验证。最终JAR经独立Java进程验证写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS、内网Kafka/YARN及吞吐量仍需集群验收。
+2026-11-03在Java 11下执行 `mvn clean verify`：149项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate规则、Flink状态恢复、真实Ignite事务/持久化、动态配置后台刷新、历史扩缩容、离线延迟清理、策略版本保护及事务回滚。同步程序另验证只修改local.properties即可发布、版本自动管理、无效配置保护及凭据隔离；最终JAR经独立Java进程验证配置发布、数据库写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS发布和读取、内网Kafka/YARN及吞吐量仍需集群验收。
 
 ## 配置
 
 复制 `config/reader.example.properties` 为 `config/local.properties`。配置按 UTF-8 读取。可以填写真实值，也可以通过 `${ENV_NAME}` 使用提交进程的环境变量。缺少变量、未知配置键、相同输入/异常Topic、非法阈值会在提交前报错，不打印凭据。
 
-历史保留条数默认10，可设置 `ignite.history.max.records`。需要运行中自动生效时，在启动配置中启用 `ignite.history.config.path=hdfs:///flink/config/heartbeat-history.properties`，把 [动态配置模板](config/heartbeat-history.properties) 上传到该HDFS路径。以后只需修改模板的 `max.records`、递增 `version` 并重新上传；默认每10秒刷新，无需重启。调小后在各梯下一条新心跳到达时事务内清理，离线梯暂不清理。完整命令、配置边界及生效查询见 [历史条数热更新](docs/heartbeat-ignite.md#历史条数热更新)。
+历史保留条数默认10，在 `local.properties` 中设置 `max.records=10`。需要运行中自动生效时，启用 `ignite.history.config.path=hdfs:///flink/config/heartbeat-history.properties`，在提交节点运行 [配置同步脚本](bin/watch-history-config.sh)。程序监视原始 `local.properties`，自动生成并更新HDFS动态文件、管理版本号；以后只改 `max.records`，不需要填写 `version` 或手动上传文件。同步与容器刷新默认各10秒，无需重启Flink；调小后在各梯下一条新心跳被接受时事务内清理，离线梯暂不清理。完整命令、配置边界及生效查询见 [历史条数热更新](docs/heartbeat-ignite.md#历史条数热更新)。旧键 `ignite.history.max.records` 仍兼容，但不能与 `max.records` 同时配置。
 
 ```bash
 export HEARTBEAT_KAFKA_BOOTSTRAP='broker1:9092,broker2:9092'

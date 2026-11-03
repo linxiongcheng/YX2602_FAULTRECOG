@@ -74,7 +74,7 @@
 
 ## 配置与预检
 
-保留现有 `config/local.properties` 的Kafka地址、消费组和HDFS目录，将示例配置中的 `ignite.*` 部分添加进去，并填写：
+保留现有 `config/local.properties` 的Kafka地址、消费组和HDFS目录，将示例配置中的Ignite连接参数、历史条数和共享配置路径添加进去，并填写：
 
 ```properties
 ignite.addresses=实际Ignite内网IP:10800
@@ -87,7 +87,7 @@ ignite.batch.size=128
 ignite.queue.capacity=1024
 ignite.batch.linger.ms=200
 ignite.flush.timeout.ms=60000
-ignite.history.max.records=10
+max.records=10
 ignite.history.config.path=hdfs:///flink/config/heartbeat-history.properties
 ignite.history.refresh.interval.ms=10000
 ```
@@ -102,6 +102,8 @@ ignite.history.refresh.interval.ms=10000
 | --check-ignite | 加载动态文件（若启用），检查Ignite连接、ACTIVE状态和表结构；不消费Kafka、不写业务数据 |
 | --preview | 读取、解析、打印，正常数据不入库；异常Topic与消费位点仍会更新 |
 | --run | 读取、解析并写入Ignite；写入失败触发Flink恢复 |
+| --publish-history-config | 在提交节点读取local.properties，按需生成或更新共享动态文件后退出；不连接Kafka/Ignite |
+| --watch-history-config | 在提交节点持续监视local.properties中的历史条数，自动发布到共享动态文件；不连接Kafka/Ignite |
 
 在提交节点执行数据库预检（不能代替YARN容器内的网络检查）：
 
@@ -121,46 +123,53 @@ export PATH=/opt/java11/bin:$PATH
   --config /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties --check-ignite
 ```
 
-启用HDFS动态配置时，先按下一节上传共享文件，再执行预检。直接用Java运行预检需要可用的Hadoop客户端类路径与配置；确保 `cdh-env.sh` 导出的 `HADOOP_CLASSPATH`、`HADOOP_CONF_DIR` 正确，能解析 `hdfs:///` 使用的默认文件系统。Flink的JobManager和TaskManager也须具备HDFS读取权限及相应运行环境。
+启用HDFS动态配置时，先按下一节生成共享文件，再执行预检。直接用Java运行预检需要可用的Hadoop客户端类路径与配置；确保 `cdh-env.sh` 导出的 `HADOOP_CLASSPATH`、`HADOOP_CONF_DIR` 正确，能解析 `hdfs:///` 使用的默认文件系统。Flink的JobManager和TaskManager也须具备HDFS读取权限及相应运行环境。
 
 ## 历史条数热更新
 
-`local.properties` 中的 `ignite.history.config.path` 指向共享HDFS文件。YARN的 `yarn.ship-files` 只复制提交时的文件，修改提交机原始 `local.properties` 不会改变正在运行的容器。共享动态文件不要通过 `yarn.ship-files` 分发。
+只维护提交节点上的 `/home/xiong/projects/YX2602_FAULTRECOG/config/local.properties`，填写 `max.records` 和前述共享路径、刷新间隔。无需填写version，无需自己创建或上传 `heartbeat-history.properties`。旧键 `ignite.history.max.records` 仍兼容，但不能与 `max.records` 同时填写。
 
-首次部署此功能时，配置上述三个 `ignite.history.*` 参数，使用当前JAR和建表结构启动一次。之后调整保留条数只需更新共享文件，无需重启Flink。
+YARN的 `yarn.ship-files` 只复制提交时的配置。由提交节点的独立同步进程监视原文件，自动把条数和版本发布到HDFS，再由运行中的写入器读取。共享动态文件不通过 `yarn.ship-files` 分发；同步进程也不能通过 `flink run-application` 放入YARN容器运行。
 
-[动态文件模板](../config/heartbeat-history.properties) 使用UTF-8，只接受以下两个配置键，允许注释，文件不超过8KiB：
-
-```properties
-version=1
-max.records=10
-```
-
-首次上传（按既有集群Hadoop环境执行）：
+首次部署新版JAR后，先生成共享文件，成功后再执行数据库预检及原有Flink提交命令：
 
 ```bash
-hdfs dfs -mkdir -p /flink/config
-hdfs dfs -put -f /home/xiong/projects/YX2602_FAULTRECOG/config/heartbeat-history.properties /flink/config/heartbeat-history.properties
-hdfs dfs -cat /flink/config/heartbeat-history.properties
+bash /home/xiong/projects/YX2602_FAULTRECOG/bin/watch-history-config.sh --once
 ```
 
-例如改为20条，编辑 `/home/xiong/projects/YX2602_FAULTRECOG/config/heartbeat-history.properties`：
+然后在提交节点启动持续同步进程（同一HDFS路径只运行一个）：
+
+```bash
+nohup bash /home/xiong/projects/YX2602_FAULTRECOG/bin/watch-history-config.sh \
+  > /home/xiong/projects/YX2602_FAULTRECOG/heartbeat-history-sync.log 2>&1 < /dev/null &
+```
+
+同步进程需要保持运行，退出或提交节点重启后由服务管理工具重新启动；仅执行 `--once` 不会监视后续修改。程序使用源文件旁的 `.history-sync.lock` 加锁，同一台机器重复启动相同配置的同步进程会失败；不要在不同机器或使用不同源文件向同一HDFS路径发布。
+
+以后调为20条，只需编辑上述 `local.properties` 并保存：
 
 ```properties
-version=2
 max.records=20
 ```
 
-然后再次执行上面的 `hdfs dfs -put -f` 和 `-cat`。保持默认上传方式，不使用 `-d` 直接写入最终文件；避免并发发布。下次改成5条时使用 `version=3`、`max.records=5`，再上传。版本必须始终递增，不能复用版本修改条数；需要恢复原上限时也要发布更高版本。
+程序自动生成更高版本并上传HDFS；条数不变时不重复发布。版本以当前时间和已有共享文件版本为基础严格递增，重启后读取共享文件继续管理。共享文件只有 `version`、`max.records` 和生成注释，不会包含Kafka地址、用户名或密码。不要手工修改、删除或回滚该生成文件。
 
-每个写入器默认每10秒读取一次，刷新间隔可在启动时设置，最小1000毫秒。成功加载后，下一批事务使用新配置快照；各任务的刷新时刻不同，不保证全局同时切换。某梯接受下一条比库内CreatedDate更新的心跳时，才会应用新的保留上限。重复、乱序旧数据或被解析层过滤的数据不会触发清理。
+可以查看同步日志和生成结果：
+
+```bash
+tail -n 30 /home/xiong/projects/YX2602_FAULTRECOG/heartbeat-history-sync.log
+hdfs dfs -cat /flink/config/heartbeat-history.properties
+```
+
+同步进程默认每10秒检查原文件，每个写入器默认再每10秒读取一次共享文件；正常情况下发布与读取合计约0～20秒，再等待该梯的下一条新心跳。刷新间隔由启动时的 `ignite.history.refresh.interval.ms` 设置，最小1000毫秒。成功加载后，下一批事务使用新配置快照；各任务的刷新时刻不同，不保证全局同时切换。某梯接受下一条比库内CreatedDate更新的心跳时，才会应用新的保留上限。重复、乱序旧数据或被解析层过滤的数据不会触发清理。
 
 - 调小：例如20→5，下一条新记录与已有最新4条一起保留，删除与写入在同一事务完成。离线电梯暂不清理。
 - 调大：例如5→20，保留现有记录，再逐步积累到20条；已删除的数据不会恢复。
-- 刷新失败：文件暂时不可读、格式错误、条数超出1～1000或版本倒退时，继续使用最后有效值并记录告警；首次加载失败则启动失败。
-- 版本保护：每台梯在最新表保存已应用版本，刷新较慢或重启的任务不能把它改回旧版本。同一个正版本存在冲突时，该梯已经落库的策略优先；必须发布更高版本修正配置。
+- 同步失败：原文件缺少显式条数、格式非法、条数超出1～1000或HDFS发布失败时，保留已发布的有效配置，记录告警并重试。不要在local.properties中填写version。共享路径改变需重启同步进程及重新提交作业；其他启动参数没有热更新能力。
+- 刷新失败：共享文件暂时不可读、格式错误或版本倒退时，写入器继续使用最后有效值并记录告警；首次加载失败则启动失败。
+- 版本保护：每台梯在最新表保存已应用版本，刷新较慢或重启的任务不能把它改回旧版本。版本由同步程序自动管理。
 
-不配置 `ignite.history.config.path` 时使用固定的 `ignite.history.max.records`（默认10），修改固定值需要重新提交。启用共享文件后，以文件里的 `max.records` 为准。已经应用动态版本的电梯不会因删除路径配置而退回版本0；后续仍应通过更高动态版本调整条数。`file:///` 仅适用于本地测试或所有执行节点都能看到同一文件内容的共享挂载，YARN环境优先使用HDFS。
+不配置 `ignite.history.config.path` 时使用固定的 `max.records`（默认10），修改固定值需要重新提交。启用共享文件后，写入器以同步程序发布的值为准。已经应用动态版本的电梯不会因删除路径配置而退回版本0；后续仍应保持同步程序运行，通过修改源文件条数调整。`file:///` 仅适用于本地测试或所有执行节点都能看到同一文件内容的共享挂载，YARN环境优先使用HDFS。同步脚本要求提交节点可执行 `hdfs dfs`、具备目标目录的创建/读写权限，安全集群还需保持Hadoop身份凭据有效。
 
 ## YARN Application正式运行
 
@@ -238,6 +247,6 @@ GROUP BY H.ELEVATOR_ID, L.HISTORY_LIMIT HAVING COUNT(*) > L.HISTORY_LIMIT;
 
 时间规则及验证说明见 [CreatedDate说明](heartbeat-time.md)。
 
-本地测试包含真实Ignite 2.18.0持久化节点、SQL建表、Java thin client和Flink MiniCluster。覆盖空值/前导零、循环历史、数据库与Flink序号分离、重放过滤、同梯并发首次写入、批次中途失败回滚、持久化重启、检查点提交等待、数据库中断后的检查点失败与恢复、队列背压及正常结束刷新。动态配置通过临时本地文件验证后台热加载、10→20→5→1→4扩缩容、离线延迟清理、无效配置保留旧值、旧任务版本保护，以及历史重排与策略元数据的事务回滚。
+本地测试包含真实Ignite 2.18.0持久化节点、SQL建表、Java thin client和Flink MiniCluster。覆盖空值/前导零、循环历史、数据库与Flink序号分离、重放过滤、同梯并发首次写入、批次中途失败回滚、持久化重启、检查点提交等待、数据库中断后的检查点失败与恢复、队列背压及正常结束刷新。动态配置通过临时本地文件验证后台热加载、10→20→5→1→4扩缩容、离线延迟清理、无效配置保留旧值、旧任务版本保护，以及历史重排与策略元数据的事务回滚。同步程序验证只修改local.properties即可发布并被写入器读取、版本自动递增及重启延续、拒绝重复同步进程、缺少条数或无效配置不覆盖有效文件、生成文件不包含凭据，以及最终JAR独立运行配置发布入口。
 
 HDFS动态文件读取及权限、内网Kafka、YARN容器网络、集群类加载配置、服务端进程崩溃/断电，以及10万条/秒吞吐量仍需集群验收。批次事务涉及多次网络调用，调整上限时还需重排该梯历史；当前默认资源与批大小是联调配置，不能据此承诺生产吞吐量。

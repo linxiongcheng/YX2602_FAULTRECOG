@@ -14,13 +14,14 @@ public final class IgniteConfig implements Serializable {
             "ignite.request.timeout.ms", "ignite.transaction.timeout.ms", "ignite.retry.attempts",
             "ignite.retry.delay.ms", "ignite.batch.size", "ignite.queue.capacity",
             "ignite.batch.linger.ms", "ignite.flush.timeout.ms", "ignite.history.max.records",
-            "ignite.history.config.path", "ignite.history.refresh.interval.ms"));
+            "ignite.history.config.path", "ignite.history.refresh.interval.ms", "max.records"));
     public final String addresses, username, password;
     public final boolean sslEnabled;
     public final int requestTimeoutMs, transactionTimeoutMs, attempts, batchSize, queueCapacity;
     public final long retryDelayMs, lingerMs, flushTimeoutMs;
     public final int historyMaxRecords, historyRefreshIntervalMs;
     public final String historyConfigPath;
+    final boolean historyMaxRecordsExplicit;
 
     IgniteConfig(Properties p, long checkpointTimeoutMs) {
         addresses = p.getProperty("ignite.addresses", "").trim();
@@ -42,7 +43,11 @@ public final class IgniteConfig implements Serializable {
         queueCapacity = integer(p, "ignite.queue.capacity", 1024);
         lingerMs = integer(p, "ignite.batch.linger.ms", 200);
         flushTimeoutMs = integer(p, "ignite.flush.timeout.ms", 60000);
-        historyMaxRecords = historyLimit(integer(p, "ignite.history.max.records", 10));
+        if (p.containsKey("max.records") && p.containsKey("ignite.history.max.records")) {
+            throw new IllegalArgumentException("max.records和ignite.history.max.records只能配置一个");
+        }
+        historyMaxRecordsExplicit = p.containsKey("max.records") || p.containsKey("ignite.history.max.records");
+        historyMaxRecords = historyLimit(integer(p, p.containsKey("max.records") ? "max.records" : "ignite.history.max.records", 10));
         historyRefreshIntervalMs = integer(p, "ignite.history.refresh.interval.ms", 10000);
         if (historyRefreshIntervalMs < 1000) {
             throw new IllegalArgumentException("ignite.history.refresh.interval.ms必须不小于1000");
@@ -197,6 +202,125 @@ public final class IgniteConfig implements Serializable {
                     return readSmallFile(stream);
                 }
             }
+
+            static boolean exists(String location) throws java.io.IOException {
+                org.apache.flink.core.fs.Path file = new org.apache.flink.core.fs.Path(location);
+                return file.getFileSystem().exists(file);
+            }
+        }
+    }
+
+    /** 在提交节点读取原始local.properties；只向共享文件发布条数和自动生成的版本。 */
+    static final class HistoryPublisher implements AutoCloseable {
+        private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("heartbeat-history-publisher");
+        private final java.nio.file.Path source;
+        private final String destination;
+        private final int intervalMs;
+        private final java.nio.channels.FileChannel lockChannel;
+        private final java.nio.channels.FileLock lock;
+        private long lastVersion;
+        private boolean failed;
+
+        HistoryPublisher(java.nio.file.Path source) throws java.io.IOException {
+            this.source = source.toRealPath();
+            IgniteConfig config = ReaderConfig.load(this.source).ignite;
+            requirePublishConfig(config);
+            destination = config.historyConfigPath;
+            if ("file".equals(java.net.URI.create(destination).getScheme())
+                    && java.nio.file.Files.exists(java.nio.file.Paths.get(java.net.URI.create(destination)))
+                    && java.nio.file.Files.isSameFile(java.nio.file.Paths.get(java.net.URI.create(destination)), this.source)) {
+                throw new IllegalArgumentException("动态文件不能覆盖local.properties");
+            }
+            intervalMs = config.historyRefreshIntervalMs;
+            lockChannel = java.nio.channels.FileChannel.open(this.source.resolveSibling(this.source.getFileName() + ".history-sync.lock"),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE);
+            java.nio.channels.FileLock acquired;
+            try {
+                acquired = lockChannel.tryLock();
+                if (acquired == null) throw new java.io.IOException("该local.properties已有配置同步进程");
+            } catch (RuntimeException | java.io.IOException error) {
+                lockChannel.close();
+                throw error;
+            }
+            lock = acquired;
+        }
+
+        private static void requirePublishConfig(IgniteConfig config) {
+            if (config.historyConfigPath.isEmpty() || !config.historyMaxRecordsExplicit) {
+                throw new IllegalArgumentException("配置同步必须显式设置max.records和ignite.history.config.path");
+            }
+        }
+
+        void sync() throws java.io.IOException, InterruptedException {
+            IgniteConfig desired = ReaderConfig.load(source).ignite;
+            requirePublishConfig(desired);
+            if (!destination.equals(desired.historyConfigPath)) {
+                throw new IllegalArgumentException("同步期间不能修改共享配置路径，请重启同步进程");
+            }
+            java.net.URI uri = java.net.URI.create(destination);
+            boolean local = "file".equals(uri.getScheme());
+            boolean exists = local ? java.nio.file.Files.exists(java.nio.file.Paths.get(uri))
+                    : HistorySettings.SharedFile.exists(destination);
+            HistoryPolicy previous = exists ? HistorySettings.readPolicy(destination) : null;
+            if (previous != null) {
+                lastVersion = Math.max(lastVersion, previous.version);
+                if (previous.maxRecords == desired.historyMaxRecords) return;
+            }
+            long version = Math.max(System.currentTimeMillis(), Math.addExact(lastVersion, 1));
+            // 先记住已分配版本；即使发布成功但响应丢失，后续也不会分配更低版本。
+            lastVersion = version;
+            byte[] bytes = ("# Generated automatically; edit max.records in local.properties.\nversion=" + version
+                    + "\nmax.records=" + desired.historyMaxRecords + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (local) {
+                java.nio.file.Path target = java.nio.file.Paths.get(uri);
+                java.nio.file.Files.createDirectories(target.getParent());
+                java.nio.file.Path temporary = java.nio.file.Files.createTempFile(target.getParent(), ".heartbeat-history-", ".tmp");
+                try {
+                    java.nio.file.Files.write(temporary, bytes);
+                    java.nio.file.Files.move(temporary, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } finally { java.nio.file.Files.deleteIfExists(temporary); }
+            } else {
+                String parent = new org.apache.flink.core.fs.Path(destination).getParent().toString();
+                hdfs(null, "-mkdir", "-p", parent);
+                // Hadoop FsShell默认先写临时文件再发布；不用-d，不把整个local.properties上传。
+                hdfs(bytes, "-put", "-f", "-", destination);
+            }
+            LOG.info("历史配置已发布: version=" + version + ", max.records=" + desired.historyMaxRecords);
+        }
+
+        void watch() throws java.io.IOException, InterruptedException {
+            sync();
+            LOG.info("正在监视local.properties中的max.records，刷新间隔=" + intervalMs + "ms");
+            while (!Thread.currentThread().isInterrupted()) {
+                Thread.sleep(intervalMs);
+                try {
+                    sync();
+                    if (failed) LOG.info("历史配置同步已恢复");
+                    failed = false;
+                } catch (java.io.IOException | RuntimeException error) {
+                    if (!failed) LOG.warning("历史配置同步失败，保留共享文件中的有效值；原因=" + error.getClass().getSimpleName());
+                    failed = true;
+                }
+            }
+        }
+
+        private static void hdfs(byte[] input, String... arguments) throws java.io.IOException, InterruptedException {
+            java.util.List<String> command = new java.util.ArrayList<>(Arrays.asList("hdfs", "dfs"));
+            command.addAll(Arrays.asList(arguments));
+            Process process = new ProcessBuilder(command).redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+            try {
+                try (java.io.OutputStream stream = process.getOutputStream()) { if (input != null) stream.write(input); }
+                if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                    throw new java.io.IOException("HDFS配置发布命令超时");
+                }
+                if (process.exitValue() != 0) throw new java.io.IOException("HDFS配置发布失败，退出码=" + process.exitValue());
+            } finally { if (process.isAlive()) process.destroyForcibly(); }
+        }
+
+        @Override public void close() throws java.io.IOException {
+            try { lock.release(); } finally { lockChannel.close(); }
         }
     }
 }

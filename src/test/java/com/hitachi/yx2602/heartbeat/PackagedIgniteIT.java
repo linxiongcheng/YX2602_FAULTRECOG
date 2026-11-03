@@ -16,6 +16,26 @@ import static org.junit.jupiter.api.Assertions.*;
 class PackagedIgniteIT {
     @TempDir Path directory;
 
+    @Test @Timeout(30) void packagedEntryGeneratesHistoryPolicyWithoutManualVersion() throws Exception {
+        Path source = directory.resolve("local.properties"), target = directory.resolve("history.properties");
+        java.util.Properties properties = ReaderConfigTest.properties();
+        properties.setProperty("max.records", "20");
+        properties.setProperty("ignite.history.config.path", target.toUri().toString());
+        try (java.io.Writer writer = Files.newBufferedWriter(source, StandardCharsets.UTF_8)) { properties.store(writer, null); }
+        Path log = directory.resolve("publisher.log");
+        Process process = new ProcessBuilder(Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Dfile.encoding=UTF-8", "-jar", Paths.get("target/heartbeat-reader-0.1.0.jar").toAbsolutePath().toString(),
+                "--config", source.toString(), "--publish-history-config")
+                .redirectErrorStream(true).redirectOutput(log.toFile()).start();
+        try {
+            assertTrue(process.waitFor(20, TimeUnit.SECONDS));
+            assertEquals(0, process.exitValue(), new String(Files.readAllBytes(log), StandardCharsets.UTF_8));
+            IgniteConfig.HistoryPolicy actual = IgniteConfig.HistorySettings.readPolicy(target.toUri().toString());
+            assertEquals(20, actual.maxRecords);
+            assertTrue(actual.version > 0);
+        } finally { if (process.isAlive()) process.destroyForcibly(); }
+    }
+
     @Test @Timeout(90) void shadedArtifactConnectsWritesAndReadsActualIgnite() throws Exception {
         IgniteStoreTest.directory = directory;
         try {

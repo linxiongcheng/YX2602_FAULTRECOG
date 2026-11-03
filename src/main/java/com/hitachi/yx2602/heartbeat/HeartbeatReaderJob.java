@@ -11,9 +11,17 @@ public final class HeartbeatReaderJob {
     public static void main(String[] args) throws Exception {
         if (args.length != 3 || !args[0].equals("--config")
                 || !(args[2].equals("--check-config") || args[2].equals("--preview")
-                || args[2].equals("--check-ignite") || args[2].equals("--run"))) {
+                || args[2].equals("--check-ignite") || args[2].equals("--run")
+                || args[2].equals("--watch-history-config") || args[2].equals("--publish-history-config"))) {
             throw new IllegalArgumentException(
-                    "用法: --config /path/reader.properties --check-config|--check-ignite|--preview|--run");
+                    "用法: --config /path/reader.properties --check-config|--check-ignite|--preview|--run|--watch-history-config|--publish-history-config");
+        }
+        if (args[2].equals("--watch-history-config") || args[2].equals("--publish-history-config")) {
+            try (IgniteConfig.HistoryPublisher publisher = new IgniteConfig.HistoryPublisher(Paths.get(args[1]))) {
+                if (args[2].equals("--watch-history-config")) publisher.watch();
+                else publisher.sync();
+            }
+            return;
         }
         ReaderConfig config = ReaderConfig.load(Paths.get(args[1]));
         if (args[2].equals("--check-config")) {
@@ -30,12 +38,19 @@ public final class HeartbeatReaderJob {
         }
         System.out.println(production ? "RUN模式：读取、解析并事务写入Ignite 2.18.0。"
                 : "PREVIEW模式：读取并解析心跳，打印单梯JSON且会推进消费位点；不写入Ignite。");
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        HeartbeatReader.configureEnvironment(env, config);
-        org.apache.flink.streaming.api.datastream.DataStream<ElevatorUpdate> updates =
-                HeartbeatParser.build(HeartbeatReader.build(env, config), config);
-        if (production) IgniteHeartbeatSink.attach(updates, config.ignite);
-        else updates.print("heartbeat-parsed-preview").uid("heartbeat-parsed-preview-v1");
-        env.execute(config.jobName);
+        Pipeline.execute(config, production);
+    }
+
+    // 配置同步入口不初始化流处理类；只有正式运行或预览时才加载Flink作业。
+    private static final class Pipeline {
+        static void execute(ReaderConfig config, boolean production) throws Exception {
+            StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+            HeartbeatReader.configureEnvironment(env, config);
+            org.apache.flink.streaming.api.datastream.DataStream<ElevatorUpdate> updates =
+                    HeartbeatParser.build(HeartbeatReader.build(env, config), config);
+            if (production) IgniteHeartbeatSink.attach(updates, config.ignite);
+            else updates.print("heartbeat-parsed-preview").uid("heartbeat-parsed-preview-v1");
+            env.execute(config.jobName);
+        }
     }
 }

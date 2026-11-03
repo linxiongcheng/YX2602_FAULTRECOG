@@ -6,5 +6,6 @@ __pycache__/
 config/local.properties
 target/
 *.log
+*.history-sync.lock
 dist/
 
