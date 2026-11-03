@@ -1,6 +1,6 @@
 package com.hitachi.yx2602.heartbeat;
 
-/** Flink POJO: retain bytes even when UTF-8 or JSON is malformed. */
+/** Kafka 原始消息：保留字节和来源位点，便于追溯非法 UTF-8 或 JSON；无参构造供 Flink 序列化使用。 */
 public class RawHeartbeat {
     public byte[] value;
     public byte[] key;

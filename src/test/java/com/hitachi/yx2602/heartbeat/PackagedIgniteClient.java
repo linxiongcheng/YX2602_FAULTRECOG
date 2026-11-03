@@ -21,11 +21,11 @@ public final class PackagedIgniteClient {
         p.setProperty("ignite.addresses", args[0]);
         IgniteConfig config = ReaderConfig.from(p, key -> null).ignite;
         ElevatorUpdate update = new ElevatorUpdate();
-        update.elevatorId = 123; update.sendTimeMs = 1000; update.historySequence = 99;
+        update.elevatorId = 123; update.createdTimeMs = 1000; update.sendTimeMs = null; update.historySequence = 99;
         update.state = new ElevatorState(); update.state.mainFaultCode = "0008";
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(config)) {
-            if (store.write(Collections.singletonList(HeartbeatRow.copyOf(update))) != 1) throw new AssertionError("first write");
-            if (store.write(Collections.singletonList(HeartbeatRow.copyOf(update))) != 0) throw new AssertionError("replay");
+            if (store.write(Collections.singletonList(IgniteHeartbeatStore.Row.copyOf(update))) != 1) throw new AssertionError("first write");
+            if (store.write(Collections.singletonList(IgniteHeartbeatStore.Row.copyOf(update))) != 0) throw new AssertionError("replay");
         }
         try (IgniteClient client = Ignition.startClient(new ClientConfiguration().setAddresses(args[0]));
              org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = client.query(new SqlFieldsQuery(

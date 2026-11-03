@@ -17,28 +17,29 @@ class ParserStateTest {
     private static final long NOW = HeartbeatSplitterTest.NOW;
 
     private KeyedOneInputStreamOperatorTestHarness<Long, ElevatorUpdate, ElevatorUpdate> harness() throws Exception {
-        return new KeyedOneInputStreamOperatorTestHarness<>(new KeyedProcessOperator<>(new AcceptNewerState(600000)),
+        return new KeyedOneInputStreamOperatorTestHarness<>(new KeyedProcessOperator<>(new HeartbeatParser.OrderingFunction(600000)),
                 update -> update.elevatorId, Types.LONG, 128, 1, 0);
     }
 
     private ElevatorUpdate update(long id, long time) {
         ElevatorUpdate update = new ElevatorUpdate();
         update.elevatorId = id;
-        update.sendTimeMs = time;
+        update.createdTimeMs = time;
+        update.sendTimeMs = NOW + 50000; // Deliberately unrelated source metadata.
         update.state = new ElevatorState();
         return update;
     }
 
     @Test void splitExpiryBoundaryAndExpiredBadFieldsDoNotGoToErrors() throws Exception {
         try (OneInputStreamOperatorTestHarness<HeartbeatMessage, ElevatorUpdate> harness =
-                     new OneInputStreamOperatorTestHarness<>(new ProcessOperator<>(new SplitHeartbeat(600000)))) {
+                     new OneInputStreamOperatorTestHarness<>(new ProcessOperator<>(new HeartbeatParser.SplitFunction(600000)))) {
             harness.open();
             harness.setProcessingTime(NOW);
             harness.processElement(new StreamRecord<>(HeartbeatSplitterTest.message(NOW - 600000, "\"EId1\":11")));
             harness.processElement(new StreamRecord<>(HeartbeatSplitterTest.message(NOW - 600001,
                     "\"EId1\":11,\"Speed1\":\"bad\"")));
             assertEquals(1, harness.extractOutputValues().size());
-            assertNull(harness.getSideOutput(SplitHeartbeat.ERRORS));
+            assertNull(harness.getSideOutput(HeartbeatParser.SplitFunction.ERRORS));
         }
     }
 
@@ -109,4 +110,5 @@ class ParserStateTest {
             assertNull(harness.extractOutputValues().get(1).state.speed);
         }
     }
+
 }

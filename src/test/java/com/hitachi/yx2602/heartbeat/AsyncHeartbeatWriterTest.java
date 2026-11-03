@@ -24,9 +24,9 @@ class AsyncHeartbeatWriterTest {
 
     @Test void checkpointBarrierWaitsForCommitAndObjectReuseDoesNotCorruptQueuedRows() throws Exception {
         CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
-        List<HeartbeatRow> committed = new ArrayList<>();
-        HeartbeatStore store = new HeartbeatStore() {
-            public int write(List<HeartbeatRow> rows) throws Exception {
+        List<IgniteHeartbeatStore.Row> committed = new ArrayList<>();
+        AsyncHeartbeatWriter.Store store = new AsyncHeartbeatWriter.Store() {
+            public int write(List<IgniteHeartbeatStore.Row> rows) throws Exception {
                 entered.countDown();
                 assertTrue(release.await(5, TimeUnit.SECONDS));
                 committed.addAll(rows);
@@ -53,9 +53,9 @@ class AsyncHeartbeatWriterTest {
 
     @Test void fullQueueBackpressuresAndNeverDropsRecords() throws Exception {
         CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
-        List<HeartbeatRow> committed = new ArrayList<>();
-        HeartbeatStore store = new HeartbeatStore() {
-            public int write(List<HeartbeatRow> rows) throws Exception {
+        List<IgniteHeartbeatStore.Row> committed = new ArrayList<>();
+        AsyncHeartbeatWriter.Store store = new AsyncHeartbeatWriter.Store() {
+            public int write(List<IgniteHeartbeatStore.Row> rows) throws Exception {
                 entered.countDown();
                 release.await(); committed.addAll(rows); return rows.size();
             }
@@ -72,13 +72,13 @@ class AsyncHeartbeatWriterTest {
             assertEquals(1, writer.queued());
             release.countDown(); third.get(5, TimeUnit.SECONDS); writer.flush();
             assertEquals(3, committed.size());
-            assertEquals(3, committed.get(2).sendTimeMs);
+            assertEquals(3, committed.get(2).createdTimeMs);
         } finally { release.countDown(); }
     }
 
     @Test void writeFailurePreventsCheckpointAcknowledgement() throws Exception {
-        HeartbeatStore store = new HeartbeatStore() {
-            public int write(List<HeartbeatRow> rows) throws IOException { throw new IOException("injected database failure"); }
+        AsyncHeartbeatWriter.Store store = new AsyncHeartbeatWriter.Store() {
+            public int write(List<IgniteHeartbeatStore.Row> rows) throws IOException { throw new IOException("injected database failure"); }
             public void close() { }
         };
         try (AsyncHeartbeatWriter writer = new AsyncHeartbeatWriter(settings(), store)) {

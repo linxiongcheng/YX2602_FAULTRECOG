@@ -1,3 +1,4 @@
+-- CreatedDate (Asia/Shanghai) is the only business clock. Fresh project schema.
 -- Apache Ignite 2.18.0 / PUBLIC schema / single node. Execute manually before starting the job.
 -- No IF NOT EXISTS: an incompatible existing table must not be silently accepted.
 -- Latest state and history must be modified through the application transaction, never independently.
@@ -6,6 +7,8 @@ CREATE TABLE PUBLIC.HB_LATEST (
     ELEVATOR_ID BIGINT NOT NULL,
     PORT INT,
     SEND_TIME_MS BIGINT,
+    SEND_TIME_RAW VARCHAR,
+    CREATED_TIME_MS BIGINT,
     FLINK_SEQUENCE BIGINT,
     RECEIVED_AT_MS BIGINT,
     PARSED_AT_MS BIGINT,
@@ -14,6 +17,8 @@ CREATE TABLE PUBLIC.HB_LATEST (
     SOURCE_OFFSET BIGINT,
     KAFKA_TIMESTAMP_MS BIGINT,
     DB_SEQUENCE BIGINT,
+    HISTORY_LIMIT INT,
+    HISTORY_POLICY_VERSION BIGINT,
     STORED_AT_MS BIGINT,
     STATE_INT_ID BIGINT,
     STATE_F_ID BIGINT,
@@ -61,6 +66,8 @@ CREATE TABLE PUBLIC.HB_HISTORY (
     SLOT INT NOT NULL,
     PORT INT,
     SEND_TIME_MS BIGINT,
+    SEND_TIME_RAW VARCHAR,
+    CREATED_TIME_MS BIGINT,
     FLINK_SEQUENCE BIGINT,
     RECEIVED_AT_MS BIGINT,
     PARSED_AT_MS BIGINT,
@@ -69,6 +76,8 @@ CREATE TABLE PUBLIC.HB_HISTORY (
     SOURCE_OFFSET BIGINT,
     KAFKA_TIMESTAMP_MS BIGINT,
     DB_SEQUENCE BIGINT,
+    HISTORY_LIMIT INT,
+    HISTORY_POLICY_VERSION BIGINT,
     STORED_AT_MS BIGINT,
     STATE_INT_ID BIGINT,
     STATE_F_ID BIGINT,

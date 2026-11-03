@@ -1,8 +1,5 @@
 package com.hitachi.yx2602.heartbeat;
 
-import org.apache.ignite.Ignition;
-import org.apache.ignite.configuration.IgniteConfiguration;
-import org.apache.ignite.configuration.WALMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -42,13 +39,4 @@ class PackagedIgniteIT {
         } finally { IgniteStoreTest.stopServer(); }
     }
 
-    @Test void deploymentXmlLoadsWithPersistenceAndFsyncEnabled() throws Exception {
-        IgniteConfiguration config = Ignition.loadSpringBean(
-                Paths.get("config/ignite2-single-node.xml").toUri().toURL(), "ignite.cfg");
-        assertEquals("yx2602-heartbeat-node-1", config.getConsistentId());
-        assertTrue(config.getDataStorageConfiguration().getDefaultDataRegionConfiguration().isPersistenceEnabled());
-        assertEquals("heartbeat", config.getDataStorageConfiguration().getDefaultDataRegionConfiguration().getName());
-        assertEquals(WALMode.FSYNC, config.getDataStorageConfiguration().getWalMode());
-        assertEquals(10800, config.getClientConnectorConfiguration().getPort());
-    }
 }

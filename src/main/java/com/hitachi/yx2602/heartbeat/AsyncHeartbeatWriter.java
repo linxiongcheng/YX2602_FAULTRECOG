@@ -8,17 +8,17 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** FIFO barriers connect database commit completion to Flink checkpoint acknowledgement. */
+/** 有界队列异步批量写库，通过先进先出的屏障确保数据库提交完成后才确认 Flink 检查点。 */
 final class AsyncHeartbeatWriter implements AutoCloseable {
     private final IgniteConfig config;
-    private final HeartbeatStore store;
+    private final Store store;
     private final ArrayBlockingQueue<Object> queue;
     private final Thread worker;
     private volatile Throwable failure;
     private volatile boolean stopped;
     final AtomicLong committed = new AtomicLong(), skipped = new AtomicLong();
 
-    AsyncHeartbeatWriter(IgniteConfig config, HeartbeatStore store) {
+    AsyncHeartbeatWriter(IgniteConfig config, Store store) {
         this.config = config;
         this.store = store;
         queue = new ArrayBlockingQueue<>(config.queueCapacity);
@@ -28,11 +28,13 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
     }
 
     void submit(ElevatorUpdate update) throws Exception {
-        enqueue(HeartbeatRow.copyOf(update), deadline());
+        // 入队前复制字段，避免 Flink 复用或后续修改原对象影响后台线程写入。
+        enqueue(IgniteHeartbeatStore.Row.copyOf(update), deadline());
     }
 
     void flush() throws Exception {
         long deadline = deadline();
+        // 屏障与数据共用队列；后台线程只有提交完屏障之前的数据，才解除等待。
         CountDownLatch barrier = new CountDownLatch(1);
         enqueue(barrier, deadline);
         while (true) {
@@ -45,6 +47,7 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
     int queued() { return queue.size(); }
 
     private void enqueue(Object entry, long deadline) throws Exception {
+        // 队列满时阻塞上游形成背压，并持续检查后台异常和超时，避免无限积压。
         while (true) {
             checkHealthy();
             if (queue.offer(entry, 100, TimeUnit.MILLISECONDS)) { checkHealthy(); return; }
@@ -57,8 +60,8 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
             while (!stopped) {
                 Object first = queue.take();
                 if (first instanceof CountDownLatch) { ((CountDownLatch) first).countDown(); continue; }
-                List<HeartbeatRow> batch = new ArrayList<>(config.batchSize);
-                batch.add((HeartbeatRow) first);
+                List<IgniteHeartbeatStore.Row> batch = new ArrayList<>(config.batchSize);
+                batch.add((IgniteHeartbeatStore.Row) first);
                 CountDownLatch barrier = null;
                 long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.lingerMs);
                 while (batch.size() < config.batchSize) {
@@ -67,9 +70,10 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
                     Object next = queue.poll(remaining, TimeUnit.NANOSECONDS);
                     if (next == null) break;
                     if (next instanceof CountDownLatch) { barrier = (CountDownLatch) next; break; }
-                    batch.add((HeartbeatRow) next);
+                    batch.add((IgniteHeartbeatStore.Row) next);
                 }
                 if (stopped) break;
+                // write 返回代表事务已提交；若失败则由 failure 传回 Flink，不能提前确认屏障。
                 int accepted = store.write(batch);
                 committed.addAndGet(accepted);
                 skipped.addAndGet(batch.size() - accepted);
@@ -95,11 +99,17 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
     }
 
     @Override public void close() throws InterruptedException {
-        // Cancellation must not flush records belonging to a failed task attempt.
+        // 取消时不主动刷出剩余队列；正常结束由 finish 刷出，失败恢复依靠重放和数据库幂等判断。
         stopped = true;
         worker.interrupt();
         worker.join(config.requestTimeoutMs + (long) config.transactionTimeoutMs + 1000);
         if (worker.isAlive()) throw new IllegalStateException("Ignite writer未在超时内停止");
         queue.clear();
+    }
+
+    /** 一批数据必须等数据库事务提交后才能返回成功，返回值为实际接受的记录数。 */
+    interface Store extends AutoCloseable {
+        int write(List<IgniteHeartbeatStore.Row> rows) throws Exception;
+        @Override void close();
     }
 }

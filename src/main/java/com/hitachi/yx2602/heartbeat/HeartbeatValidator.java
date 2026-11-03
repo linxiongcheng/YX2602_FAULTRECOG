@@ -15,7 +15,7 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
-/** Pure validation, deliberately independent of event age, elevator split and deduplication. */
+/** 整条消息校验：检查编码、JSON 和 CreatedDate；过期过滤、单梯拆分及去重由解析模块处理。 */
 public final class HeartbeatValidator {
     private final ObjectMapper mapper = new ObjectMapper(JsonFactory.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -45,19 +45,25 @@ public final class HeartbeatValidator {
         if (payload == null || !payload.isObject()) {
             return reject(record, nowMs, "INVALID_STRUCTURE", "JSON根节点必须是对象");
         }
+        JsonNode created = payload.get("CreatedDate");
+        if (HeartbeatTime.missing(created)) {
+            return reject(record, nowMs, "MISSING_CREATED_DATE", "缺少CreatedDate或值为空");
+        }
+        long createdTime;
+        try { createdTime = HeartbeatTime.parseCreatedDate(created); }
+        catch (java.time.DateTimeException | IllegalArgumentException e) {
+            return reject(record, nowMs, "INVALID_CREATED_DATE", "CreatedDate不是有效的北京时间日期，要求yyyy/M/d H:mm:ss，可选1～3位毫秒小数");
+        }
+        // 用时间差判断超前幅度，避免“当前时间 + 容忍值”发生加法溢出。
+        if (createdTime > nowMs && createdTime - nowMs > futureSkewMs) {
+            return reject(record, nowMs, "FUTURE_CREATED_DATE", "CreatedDate超过允许的时钟超前阈值");
+        }
+        // SendTime 仅保留用于追溯，缺失或格式不合法不影响消息按 CreatedDate 继续处理。
         JsonNode sent = payload.get("SendTime");
-        if (sent == null || sent.isNull() || (sent.isTextual() && sent.textValue().isEmpty())) {
-            return reject(record, nowMs, "MISSING_SEND_TIME", "缺少SendTime或值为空");
-        }
-        if (!sent.isIntegralNumber() || !sent.canConvertToLong() || sent.longValue() <= 0) {
-            return reject(record, nowMs, "INVALID_SEND_TIME", "SendTime必须是正的64位整数毫秒时间戳");
-        }
-        long sendTime = sent.longValue();
-        // Subtraction is safe for positive epoch values; avoid overflowing now + allowed skew.
-        if (sendTime > nowMs && sendTime - nowMs > futureSkewMs) {
-            return reject(record, nowMs, "FUTURE_SEND_TIME", "SendTime超过允许的时钟超前阈值");
-        }
-        return new Result(new HeartbeatMessage(text, record, nowMs, sendTime), null, null);
+        HeartbeatMessage message = new HeartbeatMessage(text, record, nowMs, createdTime);
+        message.sendTimeMs = HeartbeatTime.optionalSendTime(sent);
+        message.sendTimeRaw = sent == null ? null : sent.toString();
+        return new Result(message, null, null);
     }
 
     private Result reject(RawHeartbeat record, long nowMs, String code, String reason) {
@@ -74,7 +80,7 @@ public final class HeartbeatValidator {
         error.put("error_reason", reason);
         putBytes(error, "raw_value_base64", record.value);
         putBytes(error, "raw_key_base64", record.key);
-        // No payload-dependent serialization: byte arrays have been safely encoded as Base64.
+        // 原始字节用 Base64 保存，非法 UTF-8 或 JSON 也不会破坏异常消息的序列化。
         return new Result(null, code, error.toString());
     }
 

@@ -17,7 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.BiConsumer;
 
-/** Stateless field parsing. A bad port cannot discard the other elevators in the same message. */
+/** 无状态字段解析：逐一处理三个电梯端口，一个端口异常不影响其余有效端口。 */
 public final class HeartbeatSplitter {
     private final ObjectMapper mapper = new ObjectMapper(JsonFactory.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -43,7 +43,7 @@ public final class HeartbeatSplitter {
         port("RunTime", 0, Long.MAX_VALUE, (s, v) -> s.runTime = v);
         port("Speed", 0, Long.MAX_VALUE, (s, v) -> s.speed = v);
         port("DoorCounter", 0, Long.MAX_VALUE, (s, v) -> s.doorCounter = v);
-        // Preserve the upstream spelling in the input contract.
+        // 保留上游字段 SecDoorCouter 的原始拼写，避免改名后无法读取。
         port("SecDoorCouter", 0, Long.MAX_VALUE, (s, v) -> s.secDoorCouter = v);
         port("Weight", 0, Long.MAX_VALUE, (s, v) -> s.weight = v);
         port("TCDA", 0, 1, (s, v) -> s.tcda = v);
@@ -75,13 +75,16 @@ public final class HeartbeatSplitter {
             result.errors.add(error(message, 0, null, "INVALID_STRUCTURE", "$", "根节点必须是对象", nowMs));
             return result;
         }
-        JsonNode sendTime = root.get("SendTime");
-        if (sendTime == null || !sendTime.isIntegralNumber() || !sendTime.canConvertToLong()
-                || sendTime.longValue() <= 0 || sendTime.longValue() != message.sendTimeMs) {
-            result.errors.add(error(message, 0, null, "INVALID_SEND_TIME", "SendTime",
-                    "发送时间必须与读取模块输出的正整数毫秒时间戳一致", nowMs));
+        try {
+            if (HeartbeatTime.parseCreatedDate(root.get("CreatedDate")) != message.createdTimeMs) {
+                throw new IllegalArgumentException("CreatedDate与读取结果不一致");
+            }
+        } catch (java.time.DateTimeException | IllegalArgumentException e) {
+            result.errors.add(error(message, 0, null, "INVALID_CREATED_DATE", "CreatedDate",
+                    "CreatedDate必须为有效北京时间且与读取结果一致", nowMs));
             return result;
         }
+        // 先收集端口编号再解析字段，确保同一消息中编号重复的端口都能被识别。
         Map<Integer, Long> ids = new HashMap<>();
         Map<Long, Integer> occurrences = new HashMap<>();
         int present = 0;
@@ -94,6 +97,7 @@ public final class HeartbeatSplitter {
             try {
                 Long id = integer(root.get("EId" + port), "EId" + port, 0, Long.MAX_VALUE);
                 if (id == null) throw new FieldError("EId" + port, "非空端口必须提供有效电梯编号");
+                // EId=0 表示未接电梯；与编号缺失或非法不同，不产生异常消息。
                 if (id == 0) { result.emptyPorts++; continue; }
                 ids.put(port, id);
                 occurrences.put(id, occurrences.getOrDefault(id, 0) + 1);
@@ -130,8 +134,9 @@ public final class HeartbeatSplitter {
         return result;
     }
 
-    public static boolean expired(long sendTimeMs, long nowMs, long maxAgeMs) {
-        return nowMs > sendTimeMs && nowMs - sendTimeMs > maxAgeMs;
+    /** 超过允许年龄才过期，恰好等于阈值仍有效；阈值由配置提供，默认 10 分钟。 */
+    public static boolean expired(long createdTimeMs, long nowMs, long maxAgeMs) {
+        return nowMs > createdTimeMs && nowMs - createdTimeMs > maxAgeMs;
     }
 
     private static boolean portPresent(JsonNode root, int port) {
@@ -140,6 +145,7 @@ public final class HeartbeatSplitter {
         return false;
     }
 
+    /** 可选数值缺失时保留 null，避免把“未知”误解为正常状态或数值零。 */
     private static Long integer(JsonNode node, String field, long min, long max) throws FieldError {
         if (node == null || node.isNull()) return null;
         long value;
@@ -152,6 +158,7 @@ public final class HeartbeatSplitter {
         return value;
     }
 
+    /** 编码按字符串保存，保留上游字符串中的前导零，例如故障码“001”。 */
     private static String code(JsonNode node, String field) throws FieldError {
         if (node == null || node.isNull()) return null;
         if (node.isTextual() && !node.textValue().trim().isEmpty()) return node.textValue();
@@ -162,7 +169,7 @@ public final class HeartbeatSplitter {
     private static String text(JsonNode node, String field) throws FieldError {
         if (node == null || node.isNull()) return null;
         if (node.isTextual()) return node.textValue();
-        throw new FieldError(field, "必须为字符串；辅助时间字段不参与排序");
+        throw new FieldError(field, "必须为字符串");
     }
 
     private String error(HeartbeatMessage message, int port, Long id, String code,

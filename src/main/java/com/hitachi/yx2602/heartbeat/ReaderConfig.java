@@ -15,7 +15,7 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Validated submission-time configuration. Never log the credentials in this object. */
+/** 提交时加载并校验读取、解析和检查点配置，支持环境变量占位符；勿在日志中输出凭据。 */
 public final class ReaderConfig implements Serializable {
     private static final long serialVersionUID = 1L;
     private static final Pattern ENV = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]*)}");
@@ -109,7 +109,7 @@ public final class ReaderConfig implements Serializable {
         p.setProperty("enable.auto.commit", "false");
         p.setProperty("commit.offsets.on.checkpoint", "true");
         p.setProperty("allow.auto.create.topics", "false");
-        // New partitions require another bootstrap at resubmission; never start them unanchored.
+        // 禁止自动发现新分区；Topic 扩分区后需重新提交，由初始化流程确定新分区起始位点。
         p.setProperty("partition.discovery.interval.ms", "-1");
         return p;
     }

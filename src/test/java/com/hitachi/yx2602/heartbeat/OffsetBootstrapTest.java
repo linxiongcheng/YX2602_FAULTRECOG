@@ -19,7 +19,7 @@ class OffsetBootstrapTest {
         Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
         offsets.put(existing, new OffsetAndMetadata(0));
         offsets.put(added, null);
-        assertEquals(Collections.singleton(added), OffsetBootstrap.missingPartitions(
+        assertEquals(Collections.singleton(added), HeartbeatReader.missingPartitions(
                 new HashSet<>(Arrays.asList(existing, added)), offsets));
         assertEquals(0, offsets.get(existing).offset());
     }

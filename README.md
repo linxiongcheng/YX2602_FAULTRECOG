@@ -7,19 +7,20 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 ```text
 Kafka 原始心跳（bytes，保留来源坐标）
   → KafkaSource<RawHeartbeat>
-  → ValidateHeartbeat
-      ├─ DataStream<HeartbeatMessage> → SplitHeartbeat（分梯与字段校验）
-      │   ├─ keyBy(EId) → AcceptNewerState → DataStream<ElevatorUpdate> → Ignite事务写入（--run）
+  → HeartbeatReader.ValidationFunction
+      ├─ DataStream<HeartbeatMessage> → HeartbeatParser.SplitFunction（分梯与字段校验）
+      │   ├─ keyBy(EId) → HeartbeatParser.OrderingFunction → DataStream<ElevatorUpdate> → Ignite事务写入（--run）
       │   └─ 解析异常 → KafkaSink<String> → 同一个异常Topic
       └─ 异常侧输出 → KafkaSink<String> → 异常 Topic
 ```
 
-读取层保留原始JSON并严格校验SendTime；解析层对最多三台电梯独立处理，规范化文档定义的业务字段，并维护每台电梯的最后接受时间和历史序号。`--run` 将最新状态和最近10条历史事务写入 Ignite 2.18.0；故障真实性判别尚未实现。`--preview` 已接上完整读取与解析链路，输出带全部已定义字段（含null）的单梯JSON。
+读取层保留原始JSON，将CreatedDate按Asia/Shanghai严格解析为业务时间；解析层对最多三台电梯独立处理，规范化文档定义的业务字段，并维护每台电梯的最后接受时间和历史序号。`--run` 将最新状态和最近N条历史事务写入 Ignite 2.18.0，N默认10，支持共享HDFS配置热更新；故障真实性判别尚未实现。`--preview` 已接上完整读取与解析链路，输出带全部已定义字段（含null）的单梯JSON。
 
 | 约定 | 实现 |
 | --- | --- |
 | 格式 | UTF-8 JSON 对象，禁止重复键、尾随第二个 JSON、非标准 NaN/Infinity；嵌套深度最多100层 |
-| SendTime | JSON 正整数，64位范围，单位为 UTC Unix 毫秒；不接受字符串、浮点数、日期字符串 |
+| CreatedDate | 必填北京时间字符串，格式yyyy/M/d H:mm:ss，可选1～3位毫秒小数；统一转为UTC Unix毫秒 |
+| SendTime | 可选来源字段；为空或值非法不拒收，不参与排序、过期和未来校验 |
 | 未来时间 | 默认最多超前平台时间60000毫秒，恰好60000允许，阈值可配置 |
 | 历史时间 | 读取层放行合法历史时间；解析层过滤延迟超过10分钟的数据，恰好10分钟允许 |
 | 单梯新旧 | 只接受比该梯最后接受时间更晚的记录；同时间或更早的数据过滤并计数 |
@@ -29,40 +30,41 @@ Kafka 原始心跳（bytes，保留来源坐标）
 | 后续启动 | 保留消费组已提交位点；通过 `-s` 恢复时以检查点/保存点状态为准 |
 | 异常交付 | 至少一次，允许重放产生重复消息；失败重试，持续失败触发任务恢复 |
 
-**时间单位是上游数据契约。** 不自动猜测秒/毫秒、不用接收时间替代缺失的发送时间。误传秒级数值通常会在解析层被当作过期数据过滤；上线前应核对真实样本。平台时钟同时用于超前与过期判断，需要节点时钟同步。
+**业务时间只取CreatedDate，时区固定为北京时间（Asia/Shanghai）。** 例如 `2026/1/22 17:56:17` 对应UTC `2026-01-22T09:56:17Z`，不受JVM默认时区影响。缺失、空值或非法日期写异常Topic，不回退到SendTime、Kafka时间或接收时间。同梯CreatedDate相同仍按重复过滤；上游只提供秒精度时，同一秒最多接受一条。平台时钟用于超前与过期判断，需要节点时钟同步。
+
+按新项目首次部署：执行当前建表脚本，不加载旧SendTime版本保存点。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
 
 ## 工程结构
 
+生产代码共16个Java文件。阅读主流程时，依次查看 `HeartbeatReaderJob → HeartbeatReader → HeartbeatParser → IgniteHeartbeatSink`。各模块内部辅助逻辑放在所属文件中，跨模块使用的数据模型保持独立。
+
 ```text
 src/main/java/com/hitachi/yx2602/heartbeat/
-  ReaderConfig.java             配置加载、环境变量替换、约束检查
-  OffsetBootstrap.java          为没有位点的分区持久化首次latest起点
-  HeartbeatDeserializer.java    保留Kafka原始字节、key、topic、partition、offset
-  HeartbeatValidator.java       可独立测试的格式与时间校验
-  ValidateHeartbeat.java        Flink算子、侧输出、指标
-  HeartbeatReader.java          KafkaSource、异常KafkaSink、检查点及恢复配置
   HeartbeatReaderJob.java       配置检查、数据库预检、预览及正式运行入口
-  RawHeartbeat.java             源消息POJO
-  HeartbeatMessage.java         正常输出POJO
-  HeartbeatSplitter.java        单梯拆分、业务字段规范化、按端口生成异常
-  SplitHeartbeat.java           过期过滤、分梯算子及解析异常侧输出
-  AcceptNewerState.java         keyed state、新旧判断及历史序号递增
-  HeartbeatParser.java          解析链路及解析异常KafkaSink
-  ElevatorState.java            可空业务字段POJO
-  ElevatorUpdate.java           单梯状态、历史序号、来源信息及JSON预览
-  AcceptedVersion.java          持久化的最后接受时间和历史序号
-  IgniteConfig.java             Ignite连接、队列、事务及重试配置
-  IgniteSchema.java             数据库字段映射和启动校验
-  IgniteHeartbeatStore.java     最新状态与历史的原子事务、新旧过滤和重试
-  AsyncHeartbeatWriter.java     有界异步队列、批处理、检查点提交屏障
-  IgniteHeartbeatSink.java      Flink写入算子
-  HeartbeatRow.java              异步边界的不可变快照
-  HeartbeatStore.java            事务存储接口
+  ReaderConfig.java             配置加载、环境变量替换、读取与解析参数校验
+  IgniteConfig.java             Ignite连接、队列、事务、重试配置及历史策略热加载
+  HeartbeatReader.java          KafkaSource、首次位点初始化、反序列化、校验算子、异常Sink
+  HeartbeatValidator.java       可独立测试的UTF-8、JSON与业务时间校验
+  HeartbeatTime.java            CreatedDate北京时间解析与SendTime可选元数据
+  HeartbeatParser.java          分梯算子、过期过滤、keyed state新旧判断、解析异常Sink
+  HeartbeatSplitter.java        单梯字段解析、规范化、按端口生成异常
+  IgniteHeartbeatSink.java      Flink写入算子、检查点与正常结束刷新
+  AsyncHeartbeatWriter.java     有界异步队列、批处理、提交屏障及内部存储接口
+  IgniteHeartbeatStore.java     表结构校验、不可变写入快照、最新/历史事务与重试
+  RawHeartbeat.java             Kafka原始字节和来源坐标
+  HeartbeatMessage.java         校验后未分梯的心跳
+  ElevatorState.java            可空业务字段
+  ElevatorUpdate.java           单梯状态、时间、序号和来源信息
+  CreatedVersion.java           Flink保存的每梯业务时间和历史序号
 sql/ignite2-heartbeat.sql        手工建表脚本
-config/ignite2-single-node.xml  单节点持久化服务端模板
 config/reader.example.properties
-src/test/java/                  校验、配置、分梯、新旧过滤、检查点恢复、作业图及本地Flink运行测试
+config/heartbeat-history.properties  共享历史保留策略模板（version / max.records）
+src/test/java/                  字段、时间、状态恢复、事务、背压、真实Flink/Ignite及打包测试
 ```
+
+`HeartbeatReader` 内的 `Deserializer` 和 `ValidationFunction` 负责Flink接入；`HeartbeatParser` 内的 `SplitFunction` 和 `OrderingFunction` 负责流式处理。`IgniteHeartbeatStore` 内的 `Schema`、`Row` 分别管理表结构和写入快照。`AsyncHeartbeatWriter.Store` 是异步写入器内部的存储接口，测试通过它模拟阻塞和失败。
+
+字段解析、事务写入和异步队列各自包含独立的处理规则，分别保留文件；五个数据模型单独保留，便于查看字段及维护Flink序列化。历史热更新逻辑放在现有Ignite模块内，新增SQL策略字段；CreatedDate规则、算子UID和keyed state名称保持不变。
 
 ## 构建与测试
 
@@ -80,15 +82,13 @@ mvn -B -ntp clean verify
 
 测试中的本地Flink MiniCluster实际运行读取校验、解析、keyBy和侧输出；算子测试通过快照与恢复验证历史序号延续。测试不连接真实Kafka，不能替代Kafka断网、Broker重启、YARN恢复或性能压测。
 
-2026-10-30本机验证结果：JDK 1.8.0_381 下 `mvn verify` 成功，48项测试全部通过、无跳过；实际运行了本地Flink MiniCluster。打包后的JAR另行通过异常JSON生成和配置入口检查；应用class版本为52（Java 8）。同目录提供JAR的SHA256文件。尚未连接内网Kafka/YARN，启动位点初始化、异常Topic故障恢复及吞吐量需按下文联调步骤验证。
-
-2026-11-02解析版本验证结果：`mvn clean verify` 成功，87项测试全部通过、无跳过；包括本地Flink解析流水线和算子快照恢复。打包后的JAR另行通过分梯、异常隔离和JSON输出检查；新增解析类的class版本为52。最新JAR及SHA256位于target目录，真实Kafka/YARN与吞吐量仍待联调验证。
-
-2026-11-03存储版本验证结果：Java 11 下 `mvn clean verify` 成功，108项测试全部通过、无跳过（106项单元/集成测试及2项打包后验证）。真实Ignite 2.18.0持久化节点验证了事务回滚、十条环形历史、并发新旧判断、数据库中断后的检查点失败与恢复、重启保留数据；独立Java进程使用最终JAR完成写入与SQL查询。服务端XML模板已实际加载校验。应用class版本为55（Java 11）。内网Kafka/YARN、断电及吞吐量仍待集群验收。
+2026-11-03在Java 11下执行 `mvn verify`：143项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate北京时间解析、空SendTime、两种时间顺序冲突、过期和未来边界、Flink状态恢复，以及真实Ignite事务/持久化测试。新增动态配置后台刷新、历史扩缩容、离线延迟清理、配置异常保留旧值、策略版本保护及调整历史时的事务回滚验证。最终JAR经独立Java进程验证写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS、内网Kafka/YARN及吞吐量仍需集群验收。
 
 ## 配置
 
 复制 `config/reader.example.properties` 为 `config/local.properties`。配置按 UTF-8 读取。可以填写真实值，也可以通过 `${ENV_NAME}` 使用提交进程的环境变量。缺少变量、未知配置键、相同输入/异常Topic、非法阈值会在提交前报错，不打印凭据。
+
+历史保留条数默认10，可设置 `ignite.history.max.records`。需要运行中自动生效时，在启动配置中启用 `ignite.history.config.path=hdfs:///flink/config/heartbeat-history.properties`，把 [动态配置模板](config/heartbeat-history.properties) 上传到该HDFS路径。以后只需修改模板的 `max.records`、递增 `version` 并重新上传；默认每10秒刷新，无需重启。调小后在各梯下一条新心跳到达时事务内清理，离线梯暂不清理。完整命令、配置边界及生效查询见 [历史条数热更新](docs/heartbeat-ignite.md#历史条数热更新)。
 
 ```bash
 export HEARTBEAT_KAFKA_BOOTSTRAP='broker1:9092,broker2:9092'
@@ -145,19 +145,21 @@ HeartbeatReader.configureEnvironment(env, config);
 SingleOutputStreamOperator<HeartbeatMessage> heartbeats = HeartbeatReader.build(env, config);
 SingleOutputStreamOperator<ElevatorUpdate> updates = HeartbeatParser.build(heartbeats, config);
 
-// 在updates上接入后续持久化Sink：同一输出用于最新状态更新与历史记录写入。
+IgniteHeartbeatSink.attach(updates, config.ignite); // 同一事务写入最新状态与历史。
 // 后续算子使用固定UID。所有分支共用env；最后只执行一次env.execute。
 env.execute(config.jobName);
 ```
 
-此片段是集成位置示意：生产运行前必须在 `updates` 上接好持久化Sink。两个模块的异常Sink均由各自的 `build` 自动挂接并参与同一检查点。当前独立入口用打印Sink展示解析结果。
+该片段对应正式模式。读取和解析的异常Sink均由各自的 `build` 自动挂接，并与Ignite Sink参与同一检查点。`--preview` 入口使用打印Sink展示解析结果。
 
 `HeartbeatMessage` 的字段：
 
 | 字段 | 含义 |
 | --- | --- |
 | payloadJson | 已验证的完整原始JSON文本，尚未分梯 |
-| sendTimeMs | 终端声明的发送时间，毫秒 |
+| createdTimeMs | CreatedDate转换后的UTC Unix毫秒，唯一业务时间 |
+| sendTimeMs | SendTime为正64位整数时保留，否则null；仅来源元数据 |
+| sendTimeRaw | SendTime字段值的JSON表示；字段缺失为null，显式JSON null保存为字符串null |
 | receivedAtMs | 校验算子处理时的平台时间，毫秒；并非精确网络接收时刻 |
 | sourceTopic / sourcePartition / sourceOffset | Kafka来源位置 |
 | kafkaTimestampMs | Kafka记录时间；语义取决于Broker CreateTime/LogAppendTime配置 |
@@ -276,14 +278,14 @@ export FLINK_JOB_ID='替换为实际FlinkJobID'
     "kafka_timestamp_ms": 1793318400000
   },
   "processed_at_ms": 1793318401000,
-  "error_code": "MISSING_SEND_TIME",
-  "error_reason": "缺少SendTime或值为空",
+  "error_code": "MISSING_CREATED_DATE",
+  "error_reason": "缺少CreatedDate或值为空",
   "raw_value_base64": "e30=",
   "raw_key_base64": null
 }
 ```
 
-`raw_value_base64` 能无损恢复非法UTF-8；null表示tombstone，空字符串表示空字节。原始key同样保留。错误码包括 `NULL_VALUE`、`INVALID_UTF8`、`INVALID_JSON`、`INVALID_STRUCTURE`、`MISSING_SEND_TIME`、`INVALID_SEND_TIME`、`FUTURE_SEND_TIME`。
+`raw_value_base64` 能无损恢复非法UTF-8；null表示tombstone，空字符串表示空字节。原始key同样保留。错误码包括 `NULL_VALUE`、`INVALID_UTF8`、`INVALID_JSON`、`INVALID_STRUCTURE`、`MISSING_CREATED_DATE`、`INVALID_CREATED_DATE`、`FUTURE_CREATED_DATE`。
 
 上述为读取异常。解析异常使用同一个Topic，增加 `stage=parsing`、`port`、`elevator_id`、`error_field`，保留源位置和原始JSON的Base64；读取层输出不携带Kafka key，解析异常不包含原始key。详见解析说明中的错误码及示例。
 
@@ -292,7 +294,7 @@ export FLINK_JOB_ID='替换为实际FlinkJobID'
 ## 联调与验收
 
 1. 新测试组启动前放入一条历史记录；初始化后再发送有效心跳，确认前者跳过、后者到正常分支。
-2. 发空SendTime、非法JSON、非法UTF-8和超前60001毫秒的消息，核对异常原文、原因、topic/partition/offset。
+2. 发空CreatedDate、非法日期、非法JSON、非法UTF-8和CreatedDate超前60001毫秒的消息，核对异常原文、原因、topic/partition/offset；有效CreatedDate配空SendTime应正常通过。
 3. 读取层允许合法历史时间；解析层过滤超过10分钟的消息，不写异常Topic。恰好10分钟及超前60000毫秒的边界以确定时钟的算子测试和单元测试为准。
 4. 停止异常Topic写入权限或模拟Broker不可用，确认失败期间成功检查点不前进；恢复后异常消息最终存在，重复允许。
 5. 在第一个检查点前终止测试作业，再使用同一消费组提交，验证初始化起点防止已读未交付消息被跳过。

@@ -20,33 +20,69 @@ class HeartbeatValidatorTest {
     }
 
     @Test void preservesHistoricalAndUnknownFieldsWithoutSplitting() {
-        String json = "{\"SendTime\":1,\"EId1\":7,\"EId2\":0,\"new_field\":{\"a\":true}}";
+        String json = TimeTestData.payload(1, "\"SendTime\":\"\",\"EId1\":7,\"EId2\":0,\"new_field\":{\"a\":true}");
         HeartbeatValidator.Result result = validator.validate(raw(json), NOW);
         assertNull(result.errorJson);
         assertEquals(json, result.valid.payloadJson);
-        assertEquals(1, result.valid.sendTimeMs);
+        assertEquals(1, result.valid.createdTimeMs);
+        assertNull(result.valid.sendTimeMs);
+        assertEquals("\"\"", result.valid.sendTimeRaw);
         assertEquals(42, result.valid.sourceOffset);
         assertEquals(NOW, result.valid.receivedAtMs);
         assertEquals(NOW - 20, result.valid.kafkaTimestampMs);
     }
 
     @Test void allowsExactlySixtySecondsButRejectsOneMillisecondMore() {
-        assertNotNull(validator.validate(raw("{\"SendTime\":" + (NOW + 60000) + "}"), NOW).valid);
-        assertEquals("FUTURE_SEND_TIME", validator.validate(
-                raw("{\"SendTime\":" + (NOW + 60001) + "}"), NOW).errorCode);
+        assertNotNull(validator.validate(raw(TimeTestData.payload(NOW + 60000, "")), NOW).valid);
+        assertEquals("FUTURE_CREATED_DATE", validator.validate(
+                raw(TimeTestData.payload(NOW + 60001, "")), NOW).errorCode);
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"{}", "{\"SendTime\":null}", "{\"SendTime\":\"\"}"})
-    void missingSendTimeGoesToErrors(String json) {
-        assertEquals("MISSING_SEND_TIME", validator.validate(raw(json), NOW).errorCode);
+    @ValueSource(strings = {"{}", "{\"CreatedDate\":null}", "{\"CreatedDate\":\"\"}", "{\"CreatedDate\":\"  \"}"})
+    void missingCreatedDateGoesToErrorsEvenWhenSendTimeExists(String json) {
+        assertEquals("MISSING_CREATED_DATE", validator.validate(raw(json), NOW).errorCode);
+        assertEquals("MISSING_CREATED_DATE", validator.validate(raw("{\"SendTime\":" + NOW + "}"), NOW).errorCode);
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"true", "false", "0", "-1", "1.0", "1e3", "\"1793318400000\"",
-            "9223372036854775808", "[]", "{}"})
-    void invalidSendTimeTypesAndRanges(String value) {
-        assertEquals("INVALID_SEND_TIME", validator.validate(raw("{\"SendTime\":" + value + "}"), NOW).errorCode);
+    @ValueSource(strings = {"true", "false", "0", "1.0", "\"1793318400000\"", "[]", "{}",
+            "\"2026/2/30 12:00:00\"", "\"2026/1/1 24:00:00\"", "\"2026/1/1 12:00:60\"",
+            "\"2026/1/1 12:00:00.1234\"", "\"2026/1/1\"", "\"2026-01-01T12:00:00Z\""})
+    void invalidCreatedDateTypesAndDates(String value) {
+        assertEquals("INVALID_CREATED_DATE", validator.validate(raw("{\"CreatedDate\":" + value + "}"), NOW).errorCode);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null", "\"\"", "true", "false", "0", "-1", "1.5", "1e3", "\"bad\"",
+            "9223372036854775808", "[]", "{}", "9223372036854775807"})
+    void sendTimeNeverControlsEventValidity(String value) throws Exception {
+        HeartbeatValidator.Result result = validator.validate(raw(TimeTestData.payload(NOW, "\"SendTime\":" + value)), NOW);
+        assertNull(result.errorCode);
+        assertEquals(NOW, result.valid.createdTimeMs);
+        assertEquals(new ObjectMapper().readTree(value), new ObjectMapper().readTree(result.valid.sendTimeRaw));
+    }
+
+    @Test void sourceTimeIsOptionalAndDoesNotReplaceBusinessTime() {
+        HeartbeatMessage noSourceTime = validator.validate(raw(TimeTestData.payload(NOW, "")), NOW).valid;
+        assertNotNull(noSourceTime);
+        assertNull(noSourceTime.sendTimeMs);
+        assertNull(noSourceTime.sendTimeRaw);
+        HeartbeatMessage withSourceTime = validator.validate(raw(TimeTestData.payload(NOW, "\"SendTime\":1")), NOW).valid;
+        assertEquals(1L, withSourceTime.sendTimeMs);
+        assertEquals(NOW, withSourceTime.createdTimeMs);
+    }
+
+    @Test void parsesDocumentExampleInBeijingRegardlessOfJvmTimezone() {
+        java.util.TimeZone original = java.util.TimeZone.getDefault();
+        try {
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("America/New_York"));
+            long expected = java.time.Instant.parse("2026-01-22T09:56:17Z").toEpochMilli();
+            assertEquals(expected, HeartbeatTime.parseCreatedDate("2026/1/22 17:56:17"));
+            assertEquals(expected, HeartbeatTime.parseCreatedDate("2026/01/22 17:56:17"));
+            assertEquals(expected + 100, HeartbeatTime.parseCreatedDate("2026/1/22 17:56:17.1"));
+            assertEquals(expected + 123, HeartbeatTime.parseCreatedDate(" 2026/1/22 17:56:17.123 "));
+        } finally { java.util.TimeZone.setDefault(original); }
     }
 
     @ParameterizedTest
@@ -86,7 +122,7 @@ class HeartbeatValidatorTest {
 
     @Test void futureThresholdDoesNotOverflow() {
         HeartbeatValidator permissive = new HeartbeatValidator(Long.MAX_VALUE);
-        assertNotNull(permissive.validate(raw("{\"SendTime\":9223372036854775807}"), NOW).valid);
+        assertNotNull(permissive.validate(raw("{\"CreatedDate\":\"9999/12/31 23:59:59.999\"}"), NOW).valid);
     }
 
     @Test void deepJsonIsQuarantinedInsteadOfCrashingTask() {

@@ -23,7 +23,7 @@ class HeartbeatPipelineTest {
     @Test void kafkaDeserializerRetainsMalformedBytesAndCoordinates() throws Exception {
         List<RawHeartbeat> output = new ArrayList<>();
         byte[] bytes = {(byte) 0xff};
-        new HeartbeatDeserializer().deserialize(new ConsumerRecord<>("test", 2, 14, null, bytes),
+        new HeartbeatReader.Deserializer().deserialize(new ConsumerRecord<>("test", 2, 14, null, bytes),
                 new Collector<RawHeartbeat>() {
                     public void collect(RawHeartbeat value) { output.add(value); }
                     public void close() { }
@@ -55,21 +55,21 @@ class HeartbeatPipelineTest {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(1);
         SingleOutputStreamOperator<HeartbeatMessage> valid = env.fromCollection(Arrays.asList(
-                new RawHeartbeat("{\"SendTime\":1,\"EId1\":7}".getBytes(StandardCharsets.UTF_8),
+                new RawHeartbeat("{\"CreatedDate\":\"1970/1/1 8:00:00.001\",\"SendTime\":\"\",\"EId1\":7}".getBytes(StandardCharsets.UTF_8),
                         null, "test", 0, 1, 1),
                 new RawHeartbeat("{\"SendTime\":\"\"}".getBytes(StandardCharsets.UTF_8),
                         null, "test", 0, 2, 2),
                 new RawHeartbeat(new byte[]{(byte) 0xff}, null, "test", 0, 3, 3)
-        )).process(new ValidateHeartbeat(60000));
-        DataStream<String> all = valid.map(value -> "valid:" + value.sendTimeMs)
-                .union(valid.getSideOutput(ValidateHeartbeat.ERRORS));
+        )).process(new HeartbeatReader.ValidationFunction(60000));
+        DataStream<String> all = valid.map(value -> "valid:" + value.createdTimeMs)
+                .union(valid.getSideOutput(HeartbeatReader.ValidationFunction.ERRORS));
         List<String> results = new ArrayList<>();
         try (CloseableIterator<String> iterator = all.executeAndCollect()) {
             iterator.forEachRemaining(results::add);
         }
         assertEquals(3, results.size());
         assertTrue(results.contains("valid:1"));
-        assertEquals(1, results.stream().filter(value -> value.contains("MISSING_SEND_TIME")).count());
+        assertEquals(1, results.stream().filter(value -> value.contains("MISSING_CREATED_DATE")).count());
         assertEquals(1, results.stream().filter(value -> value.contains("INVALID_UTF8")).count());
     }
 }

@@ -3,12 +3,16 @@ package com.hitachi.yx2602.heartbeat;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-/** One accepted snapshot supplies both the future latest-state write and history write. */
+/** 单梯状态及来源信息：拆分后经新旧判断，再用于更新最新状态和历史记录。 */
 public class ElevatorUpdate {
     private static final ObjectMapper JSON = new ObjectMapper();
     public long elevatorId;
     public int port;
-    public long sendTimeMs;
+    /** 唯一业务时间，来自 CreatedDate；SendTime 仅作为附加信息保存。 */
+    public long createdTimeMs;
+    public Long sendTimeMs;
+    public String sendTimeRaw;
+    /** Flink 按电梯接受数据的序号，入库为 FLINK_SEQUENCE；历史槽位使用独立的 DB_SEQUENCE。 */
     public long historySequence;
     public long receivedAtMs;
     public long parsedAtMs;
@@ -25,6 +29,8 @@ public class ElevatorUpdate {
         update.elevatorId = id;
         update.port = port;
         update.sendTimeMs = message.sendTimeMs;
+        update.sendTimeRaw = message.sendTimeRaw;
+        update.createdTimeMs = message.createdTimeMs;
         update.receivedAtMs = message.receivedAtMs;
         update.sourceTopic = message.sourceTopic;
         update.sourcePartition = message.sourcePartition;

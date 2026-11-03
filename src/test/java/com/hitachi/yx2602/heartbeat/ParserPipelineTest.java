@@ -66,6 +66,42 @@ class ParserPipelineTest {
                 "heartbeat-parser-error-kafka-v1", "heartbeat-parsed-preview-v1")));
         assertTrue(TypeInformation.of(ElevatorState.class) instanceof PojoTypeInfo);
         assertTrue(TypeInformation.of(ElevatorUpdate.class) instanceof PojoTypeInfo);
-        assertTrue(TypeInformation.of(AcceptedVersion.class) instanceof PojoTypeInfo);
+        assertTrue(TypeInformation.of(CreatedVersion.class) instanceof PojoTypeInfo);
+    }
+
+    @Test @Timeout(90) void readerAndParserUseCreatedDateForAgeOrderAndMetadata() throws Exception {
+        long now = System.currentTimeMillis();
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
+        List<RawHeartbeat> input = new ArrayList<>();
+        String[] payloads = {
+                TimeTestData.payload(now - 3000, "\"EId1\":11,\"SendTime\":9223372036854775807"),
+                TimeTestData.payload(now - 2000, "\"EId1\":11,\"SendTime\":\"\""),
+                TimeTestData.payload(now - 2500, "\"EId1\":11,\"SendTime\":9223372036854775807"),
+                TimeTestData.payload(now - 2000, "\"EId1\":11,\"SendTime\":1"),
+                TimeTestData.payload(now - 700000, "\"EId1\":22,\"SendTime\":" + now),
+                "{\"EId1\":33,\"SendTime\":" + now + "}"
+        };
+        for (int i = 0; i < payloads.length; i++) input.add(new RawHeartbeat(
+                payloads[i].getBytes(java.nio.charset.StandardCharsets.UTF_8), null, "test", 0, i, now));
+        org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator<HeartbeatMessage> read =
+                env.fromCollection(input).process(new HeartbeatReader.ValidationFunction(60000));
+        Properties properties = ReaderConfigTest.properties(); properties.setProperty("parallelism", "1");
+        HeartbeatParser.Streams streams = HeartbeatParser.transform(read, ReaderConfig.from(properties, key -> null));
+        DataStream<String> all = streams.valid.map(ElevatorUpdate::toString).union(streams.errors,
+                read.getSideOutput(HeartbeatReader.ValidationFunction.ERRORS));
+        List<JsonNode> results = new ArrayList<>();
+        try (CloseableIterator<String> iterator = all.executeAndCollect()) {
+            ObjectMapper mapper = new ObjectMapper();
+            while (iterator.hasNext()) results.add(mapper.readTree(iterator.next()));
+        }
+        assertEquals(3, results.size());
+        assertEquals(1, results.stream().filter(node -> node.path("error_code").asText().equals("MISSING_CREATED_DATE")).count());
+        List<JsonNode> valid = results.stream().filter(node -> node.has("elevatorId")).collect(Collectors.toList());
+        assertEquals(now - 3000, valid.get(0).get("createdTimeMs").asLong());
+        assertEquals(now - 2000, valid.get(1).get("createdTimeMs").asLong());
+        assertEquals(2, valid.get(1).get("historySequence").asLong());
+        assertTrue(valid.get(1).get("sendTimeMs").isNull());
+        assertEquals("\"\"", valid.get(1).get("sendTimeRaw").asText());
     }
 }

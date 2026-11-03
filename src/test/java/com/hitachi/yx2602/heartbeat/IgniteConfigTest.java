@@ -36,7 +36,10 @@ class IgniteConfigTest {
                 {"ignite.queue.capacity", "1"}, {"ignite.batch.size", "0"},
                 {"ignite.flush.timeout.ms", "180000"}, {"ignite.transaction.timeout.ms", "60000"},
                 {"ignite.retry.attempts", "0"}, {"ignite.ssl.enabled", "yes"},
-                {"ignite.username", "user-without-password"}, {"ignite.adresses", "typo:10800"}}) {
+                {"ignite.username", "user-without-password"}, {"ignite.adresses", "typo:10800"},
+                {"ignite.history.max.records", "0"}, {"ignite.history.max.records", "1001"},
+                {"ignite.history.refresh.interval.ms", "10"}, {"ignite.history.config.path", "local.properties"},
+                {"ignite.history.config.path", "https://example.invalid/history.properties"}}) {
             Properties p = ReaderConfigTest.properties(); p.setProperty(entry[0], entry[1]);
             assertThrows(IllegalArgumentException.class, () -> ReaderConfig.from(p, key -> null), entry[0]);
         }
@@ -45,6 +48,6 @@ class IgniteConfigTest {
     @Test void schemaCoversEveryParserBusinessField() {
         assertEquals(java.util.Arrays.stream(ElevatorState.class.getFields())
                 .filter(field -> !java.lang.reflect.Modifier.isStatic(field.getModifiers())).count(),
-                IgniteSchema.STATE_FIELDS.size());
+                IgniteHeartbeatStore.Schema.STATE_FIELDS.size());
     }
 }
