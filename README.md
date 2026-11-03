@@ -1,6 +1,6 @@
-# YX2602 心跳数据读取与解析
+# YX2602 心跳数据读取、解析与存储
 
-Java 8 / Flink 1.20.5 实现。读取Kafka心跳，完成格式校验、分梯、字段规范化、10分钟过期过滤及按电梯判断新旧，输出带历史序号的单梯状态。读取和解析异常都可靠写入配置的异常Topic。解析规则与字段映射详见 [解析模块说明](docs/heartbeat-parser.md)。
+Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式校验、分梯、字段规范化、10分钟过期过滤及按电梯判断新旧，输出带历史序号的单梯状态。读取和解析异常都可靠写入配置的异常Topic。解析规则与字段映射详见 [解析模块说明](docs/heartbeat-parser.md)。正式写入与部署详见 [Ignite 模块说明](docs/heartbeat-ignite.md)。
 
 ## 实现范围
 
@@ -9,12 +9,12 @@ Kafka 原始心跳（bytes，保留来源坐标）
   → KafkaSource<RawHeartbeat>
   → ValidateHeartbeat
       ├─ DataStream<HeartbeatMessage> → SplitHeartbeat（分梯与字段校验）
-      │   ├─ keyBy(EId) → AcceptNewerState → DataStream<ElevatorUpdate>
+      │   ├─ keyBy(EId) → AcceptNewerState → DataStream<ElevatorUpdate> → Ignite事务写入（--run）
       │   └─ 解析异常 → KafkaSink<String> → 同一个异常Topic
       └─ 异常侧输出 → KafkaSink<String> → 异常 Topic
 ```
 
-读取层保留原始JSON并严格校验SendTime；解析层对最多三台电梯独立处理，规范化文档定义的业务字段，并维护每台电梯的最后接受时间和历史序号。本次不写Ignite3、不实现故障真实性判别。`--preview` 已接上完整读取与解析链路，输出带全部已定义字段（含null）的单梯JSON。
+读取层保留原始JSON并严格校验SendTime；解析层对最多三台电梯独立处理，规范化文档定义的业务字段，并维护每台电梯的最后接受时间和历史序号。`--run` 将最新状态和最近10条历史事务写入 Ignite 2.18.0；故障真实性判别尚未实现。`--preview` 已接上完整读取与解析链路，输出带全部已定义字段（含null）的单梯JSON。
 
 | 约定 | 实现 |
 | --- | --- |
@@ -41,7 +41,7 @@ src/main/java/com/hitachi/yx2602/heartbeat/
   HeartbeatValidator.java       可独立测试的格式与时间校验
   ValidateHeartbeat.java        Flink算子、侧输出、指标
   HeartbeatReader.java          KafkaSource、异常KafkaSink、检查点及恢复配置
-  HeartbeatReaderJob.java       显式预览入口
+  HeartbeatReaderJob.java       配置检查、数据库预检、预览及正式运行入口
   RawHeartbeat.java             源消息POJO
   HeartbeatMessage.java         正常输出POJO
   HeartbeatSplitter.java        单梯拆分、业务字段规范化、按端口生成异常
@@ -51,21 +51,30 @@ src/main/java/com/hitachi/yx2602/heartbeat/
   ElevatorState.java            可空业务字段POJO
   ElevatorUpdate.java           单梯状态、历史序号、来源信息及JSON预览
   AcceptedVersion.java          持久化的最后接受时间和历史序号
+  IgniteConfig.java             Ignite连接、队列、事务及重试配置
+  IgniteSchema.java             数据库字段映射和启动校验
+  IgniteHeartbeatStore.java     最新状态与历史的原子事务、新旧过滤和重试
+  AsyncHeartbeatWriter.java     有界异步队列、批处理、检查点提交屏障
+  IgniteHeartbeatSink.java      Flink写入算子
+  HeartbeatRow.java              异步边界的不可变快照
+  HeartbeatStore.java            事务存储接口
+sql/ignite2-heartbeat.sql        手工建表脚本
+config/ignite2-single-node.xml  单节点持久化服务端模板
 config/reader.example.properties
 src/test/java/                  校验、配置、分梯、新旧过滤、检查点恢复、作业图及本地Flink运行测试
 ```
 
 ## 构建与测试
 
-联网构建机使用 JDK 8 和 Maven 3.9：
+联网构建机使用 JDK 11 和 Maven 3.9（`mvn -version` 的 Java home 也必须指向 JDK 11）：
 
 ```bash
 java -version
 mvn -version
-mvn -B -ntp verify
+mvn -B -ntp clean verify
 ```
 
-产物为 `target/heartbeat-reader-0.1.0.jar`。该 JAR 包含 Kafka Connector 3.3.0-1.20、Kafka客户端及应用所需 JSON 依赖，不包含 Flink 集群运行时。Jackson 已重定位以避免与集群库冲突。使用此 JAR 时无需额外安装 Kafka SQL Connector，也不依赖 Python。
+产物为 `target/heartbeat-reader-0.1.0.jar`。该 JAR 包含 Kafka Connector 3.3.0-1.20、Kafka客户端、Ignite 2.18.0 thin client 及应用所需 JSON 依赖，不包含 Flink 集群运行时。Jackson 已重定位以避免与集群库冲突。使用此 JAR 时无需额外安装 Kafka SQL Connector，也不依赖 Python。
 
 首次构建需下载 Maven 依赖；离线环境可直接部署构建好的 JAR。若需离线重新构建，应提前准备同一版本的 Maven 依赖缓存与构建插件。
 
@@ -74,6 +83,8 @@ mvn -B -ntp verify
 2026-10-30本机验证结果：JDK 1.8.0_381 下 `mvn verify` 成功，48项测试全部通过、无跳过；实际运行了本地Flink MiniCluster。打包后的JAR另行通过异常JSON生成和配置入口检查；应用class版本为52（Java 8）。同目录提供JAR的SHA256文件。尚未连接内网Kafka/YARN，启动位点初始化、异常Topic故障恢复及吞吐量需按下文联调步骤验证。
 
 2026-11-02解析版本验证结果：`mvn clean verify` 成功，87项测试全部通过、无跳过；包括本地Flink解析流水线和算子快照恢复。打包后的JAR另行通过分梯、异常隔离和JSON输出检查；新增解析类的class版本为52。最新JAR及SHA256位于target目录，真实Kafka/YARN与吞吐量仍待联调验证。
+
+2026-11-03存储版本验证结果：Java 11 下 `mvn clean verify` 成功，108项测试全部通过、无跳过（106项单元/集成测试及2项打包后验证）。真实Ignite 2.18.0持久化节点验证了事务回滚、十条环形历史、并发新旧判断、数据库中断后的检查点失败与恢复、重启保留数据；独立Java进程使用最终JAR完成写入与SQL查询。服务端XML模板已实际加载校验。应用class版本为55（Java 11）。内网Kafka/YARN、断电及吞吐量仍待集群验收。
 
 ## 配置
 
@@ -155,58 +166,64 @@ env.execute(config.jobName);
 
 ## YARN Session 预览
 
-预览会消费消息、解析分梯、保存Flink处理状态、写异常Topic并推进消费组位点；正常结果打印单梯JSON，不落地Ignite3。必须使用独立测试Topic和消费组。入口要求显式 `--preview`，避免把预览误当成生产处理。
+预览会消费消息、解析分梯、保存Flink处理状态、写异常Topic并推进消费组位点；正常结果打印单梯JSON，不写入Ignite。必须使用独立测试Topic和消费组。预览使用显式 `--preview`；正式入库使用 `--run`。
 
 在已部署Flink 1.20.5的提交节点，复制JAR和配置文件后：
 
 ```bash
 source /opt/flink-1.20.5/conf/cdh-env.sh
+export JAVA_HOME=/opt/java11
+export PATH=/opt/java11/bin:$PATH
 export FLINK_APP_ID='application_实际SessionID'
 
 # 先做纯配置检查，不连接Kafka，不提交作业。
-java -cp '/opt/YX2602_FAULTRECOG/heartbeat-reader-0.1.0.jar:/opt/flink-1.20.5/lib/*' \
+java -cp '/home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar:/opt/flink-1.20.5/lib/*' \
   com.hitachi.yx2602.heartbeat.HeartbeatReaderJob \
-  --config /opt/YX2602_FAULTRECOG/config/local.properties --check-config
+  --config /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties --check-config
 
 /opt/flink-1.20.5/bin/flink run \
   -t yarn-session -Dyarn.application.id="$FLINK_APP_ID" -d \
   -c com.hitachi.yx2602.heartbeat.HeartbeatReaderJob \
-  /opt/YX2602_FAULTRECOG/heartbeat-reader-0.1.0.jar \
-  --config /opt/YX2602_FAULTRECOG/config/local.properties --preview
+  /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
+  --config /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties --preview
 ```
 
-使用 `flink stop --savepointPath ...` 保存并停止；恢复提交时加 `-s 实际保存点路径`，保持源与状态算子UID不变。不要用删除消费组、重置位点或 `--allowNonRestoredState` 来绕过恢复错误。
+YARN Session 必须由 Java 11 启动；客户端设置 JAVA_HOME 不能升级已经运行的 Session 容器。使用 `flink stop --savepointPath ...` 保存并停止；恢复提交时加 `-s 实际保存点路径`，保持源与状态算子UID不变。不要用删除消费组、重置位点或 `--allowNonRestoredState` 来绕过恢复错误。
 
 ## YARN Application 部署
 
-本项目采用Application模式时，直接为心跳作业创建独立YARN应用，无需先启动Session。当前入口为读取与解析预览模式：正常结果打印单梯JSON，异常消息实际写Kafka，消费位点实际推进。首次验证使用独立测试消费组；同一消费组不可同时运行Session作业和Application作业。
+本项目采用Application模式时，直接为心跳作业创建独立YARN应用，无需先启动Session。以下命令为读取与解析预览模式，正式入库请参照 [Ignite部署步骤](docs/heartbeat-ignite.md)：正常结果打印单梯JSON，异常消息实际写Kafka，消费位点实际推进。首次验证使用独立测试消费组；同一消费组不可同时运行Session作业和Application作业。
 
 在提交节点准备以下两个文件：
 
 ```text
-/opt/YX2602_FAULTRECOG/heartbeat-reader-0.1.0.jar
-/opt/YX2602_FAULTRECOG/config/local.properties
+/home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar
+/home/xiong/projects/YX2602_FAULTRECOG/config/local.properties
 ```
 
 将实际Kafka地址、输入与异常Topic、消费组、检查点路径填写到配置中。首次预览建议 `kafka.group.id=heartbeat-reader-preview`、`checkpoint.storage=hdfs:///flink/checkpoints/heartbeat3-reader-preview`。两个Topic需提前创建；提交账号应有HDFS目录写权限，JobManager与TaskManager节点均需能访问Kafka。
 
 ```bash
 source /opt/flink-1.20.5/conf/cdh-env.sh
+export JAVA_HOME=/opt/java11
+export PATH=/opt/java11/bin:$PATH
 hdfs dfs -mkdir -p /flink/checkpoints/heartbeat3-reader-preview /flink/savepoints/heartbeat3-reader-preview
 
-java -cp '/opt/YX2602_FAULTRECOG/heartbeat-reader-0.1.0.jar:/opt/flink-1.20.5/lib/*' \
+java -cp '/home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar:/opt/flink-1.20.5/lib/*' \
   com.hitachi.yx2602.heartbeat.HeartbeatReaderJob \
-  --config /opt/YX2602_FAULTRECOG/config/local.properties --check-config
+  --config /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties --check-config
 
 /opt/flink-1.20.5/bin/flink run-application \
   -t yarn-application \
+  -Denv.java.home=/opt/java11 \
+  -Dclassloader.parent-first-patterns.additional=org.apache.kafka. \
   -Dyarn.application.name=yx2602-heartbeat-reader-preview \
   -Djobmanager.memory.process.size=1024m \
   -Dtaskmanager.memory.process.size=2048m \
   -Dtaskmanager.numberOfTaskSlots=2 \
-  -Dyarn.ship-files=/opt/YX2602_FAULTRECOG/config/local.properties \
+  -Dyarn.ship-files=/home/xiong/projects/YX2602_FAULTRECOG/config/local.properties \
   -c com.hitachi.yx2602.heartbeat.HeartbeatReaderJob \
-  /opt/YX2602_FAULTRECOG/heartbeat-reader-0.1.0.jar \
+  /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
   --config local.properties --preview
 ```
 

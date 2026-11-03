@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ignite 2.18.0 server template. Change the bind address before deployment.
+     Start with Java 11 and the distribution's ignite.sh (includes required JVM options). -->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans https://www.springframework.org/schema/beans/spring-beans.xsd">
+  <bean id="ignite.cfg" class="org.apache.ignite.configuration.IgniteConfiguration">
+    <property name="igniteInstanceName" value="yx2602-heartbeat"/>
+    <property name="consistentId" value="yx2602-heartbeat-node-1"/>
+    <!-- Replace with this server's private IP. Do not use 0.0.0.0 for discovery. -->
+    <property name="localHost" value="127.0.0.1"/>
+    <property name="workDirectory" value="/home/xiong/ignite-data/heartbeat/work"/>
+    <property name="clientConnectorConfiguration">
+      <bean class="org.apache.ignite.configuration.ClientConnectorConfiguration">
+        <property name="port" value="10800"/>
+        <property name="portRange" value="0"/>
+      </bean>
+    </property>
+    <property name="discoverySpi">
+      <bean class="org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi">
+        <property name="ipFinder">
+          <bean class="org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder">
+            <property name="addresses"><list><value>127.0.0.1:47500</value></list></property>
+          </bean>
+        </property>
+      </bean>
+    </property>
+    <property name="dataStorageConfiguration">
+      <bean class="org.apache.ignite.configuration.DataStorageConfiguration">
+        <property name="storagePath" value="/home/xiong/ignite-data/heartbeat/db"/>
+        <property name="walPath" value="/home/xiong/ignite-data/heartbeat/wal"/>
+        <property name="walArchivePath" value="/home/xiong/ignite-data/heartbeat/wal-archive"/>
+        <property name="walMode" value="FSYNC"/>
+        <property name="defaultDataRegionConfiguration">
+          <bean class="org.apache.ignite.configuration.DataRegionConfiguration">
+            <property name="name" value="heartbeat"/>
+            <property name="persistenceEnabled" value="true"/>
+            <property name="initialSize" value="268435456"/>
+            <property name="maxSize" value="1073741824"/>
+          </bean>
+        </property>
+      </bean>
+    </property>
+  </bean>
+</beans>

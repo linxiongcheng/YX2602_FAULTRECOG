@@ -24,6 +24,7 @@ public final class ReaderConfig implements Serializable {
     public final long futureSkewMs, checkpointIntervalMs, checkpointTimeoutMs, restartDelayMs;
     public final long parserMaxAgeMs;
     public final int parserMaxParallelism;
+    public final IgniteConfig ignite;
     private final Properties connectionProperties = new Properties();
 
     private ReaderConfig(Properties p) {
@@ -41,7 +42,7 @@ public final class ReaderConfig implements Serializable {
                     throw new IllegalArgumentException("禁止覆盖消费或可靠性设置: " + key);
                 }
                 connectionProperties.setProperty(clientKey, p.getProperty(key));
-            } else if (!known.contains(key)) {
+            } else if (!known.contains(key) && !IgniteConfig.KEYS.contains(key)) {
                 throw new IllegalArgumentException("未知配置项: " + key);
             }
         }
@@ -76,6 +77,7 @@ public final class ReaderConfig implements Serializable {
         if (checkpointTimeoutMs <= deliveryTimeoutMs) {
             throw new IllegalArgumentException("检查点超时必须大于Kafka发送超时");
         }
+        ignite = new IgniteConfig(p, checkpointTimeoutMs);
     }
 
     public static ReaderConfig load(Path path) throws IOException {

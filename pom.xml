@@ -7,8 +7,10 @@
   <version>0.1.0</version>
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <maven.compiler.source>8</maven.compiler.source>
-    <maven.compiler.target>8</maven.compiler.target>
+    <maven.compiler.release>11</maven.compiler.release>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <ignite.version>2.18.0</ignite.version>
     <flink.version>1.20.5</flink.version>
     <kafka.connector.version>3.3.0-1.20</kafka.connector.version>
   </properties>
@@ -21,6 +23,18 @@
     </dependencies>
   </dependencyManagement>
   <dependencies>
+    <dependency>
+      <groupId>org.apache.ignite</groupId><artifactId>ignite-core</artifactId>
+      <version>${ignite.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.ignite</groupId><artifactId>ignite-indexing</artifactId>
+      <version>${ignite.version}</version><scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.ignite</groupId><artifactId>ignite-spring</artifactId>
+      <version>${ignite.version}</version><scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.apache.flink</groupId><artifactId>flink-streaming-java</artifactId>
       <version>${flink.version}</version><type>test-jar</type><scope>test</scope>
@@ -92,9 +106,16 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.5.2</version>
         <configuration>
-          <argLine>-Dfile.encoding=UTF-8</argLine>
+          <argLine>-Dfile.encoding=UTF-8 --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED</argLine>
           <systemPropertyVariables><org.slf4j.simpleLogger.defaultLogLevel>warn</org.slf4j.simpleLogger.defaultLogLevel></systemPropertyVariables>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-failsafe-plugin</artifactId><version>3.5.2</version>
+        <configuration>
+          <argLine>-Dfile.encoding=UTF-8 --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED</argLine>
+        </configuration>
+        <executions><execution><goals><goal>integration-test</goal><goal>verify</goal></goals></execution></executions>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId><artifactId>maven-shade-plugin</artifactId><version>3.6.0</version>

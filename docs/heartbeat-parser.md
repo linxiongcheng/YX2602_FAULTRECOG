@@ -1,6 +1,6 @@
 # 心跳解析模块实现与部署
 
-本模块将读取层的 `HeartbeatMessage` 拆成单梯 `ElevatorUpdate`。继续使用Java 8、Flink 1.20.5，沿用已有YARN Application入口和异常Topic。当前预览会执行读取、解析和状态更新，输出完整单梯JSON；Ignite3写入及故障真实性判别尚未实现。
+本模块将读取层的 `HeartbeatMessage` 拆成单梯 `ElevatorUpdate`。使用Java 11、Flink 1.20.5，沿用已有YARN Application入口和异常Topic。当前预览会执行读取、解析和状态更新，输出完整单梯JSON；正式模式 `--run` 已接入 [Ignite 2.18.0 写入模块](heartbeat-ignite.md)，故障真实性判别尚未实现。
 
 ## 处理顺序
 
@@ -106,8 +106,11 @@ parser.max.parallelism=128
 
 ```bash
 source /opt/flink-1.20.5/conf/cdh-env.sh
+export JAVA_HOME=/opt/java11
+export PATH=/opt/java11/bin:$PATH
 /opt/flink-1.20.5/bin/flink run-application \
   -t yarn-application \
+  -Denv.java.home=/opt/java11 \
   -Dyarn.application.name=yx2602-heartbeat-parser-preview \
   -Djobmanager.memory.process.size=1024m \
   -Dtaskmanager.memory.process.size=2048m \
@@ -139,4 +142,4 @@ source /opt/flink-1.20.5/conf/cdh-env.sh
 
 2026-11-02执行 `mvn clean verify`：全工程87项测试通过、无失败或跳过。打包后的JAR通过独立分梯与JSON序列化检查，Java class版本为52；同目录的 `.sha256` 文件用于核对传输后的JAR。
 
-尚未在真实Kafka/YARN集群运行本版，也未验证10万条/秒。集群验收应检查解析输出、错误Topic、上述指标、保存点恢复，以及正常分支后续接入持久化后的端到端一致性。
+尚未在真实Kafka/YARN集群运行本版，也未验证10万条/秒。集群验收应检查解析输出、错误Topic、上述指标、保存点恢复，以及持久化链路的端到端一致性。
