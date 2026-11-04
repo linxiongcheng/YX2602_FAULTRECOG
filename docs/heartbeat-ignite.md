@@ -232,6 +232,14 @@ hdfs dfs -cat /flink/projectConfig/faultRecog/heartbeat-history.properties
 
 ## YARN Application正式运行
 
+完成前述建表、配置和动态配置同步准备后，可直接使用启动脚本（与下方提交命令参数一致）：
+
+```bash
+bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh
+```
+
+脚本使用固定集群路径，检查所需文件和可执行程序，加载CDH环境后提交作业；无需重新打包JAR。每次执行都会提交一个新的Application，不会停止或复用已有作业，已有任务运行时不要重复执行。历史配置同步仍由 `watch-history-config.sh` 单独负责。脚本为Linux LF换行，请使用Bash执行。
+
 所有可能运行JobManager/TaskManager的节点均须安装Java 11到 `/opt/java11`。提交终端的JAVA_HOME和 `env.java.home` 不能替代YARN容器的JAVA_HOME；下方两个 `containerized.*.env.JAVA_HOME` 参数分别指定AM/JobManager和TaskManager的Java路径。保持集群现有Kafka父加载优先参数，其客户端兼容性仍需集群验证。
 
 ```bash
@@ -286,6 +294,68 @@ yarn logs -applicationId "$FLINK_APP_ID" \
 
 正式模式的正常心跳写入Ignite，不会像 `--preview` 一样逐条打印JSON。收到Application ID仅表示提交已受理。启动错误优先看JobManager/AM的 `stderr`、`jobmanager.log` 和 `prelaunch.err`，后续处理错误还需查看TaskManager日志。未启用日志聚合或日志尚未聚合时，从YARN页面进入对应Attempt和容器的Logs。
 
+## Ignite实际持久化目录
+
+2026-11-04 根据服务器 `AI-slave06` 的现场命令截图核对：该节点的Ignite运行在Docker容器环境中，`HB_STATE` 分区数据文件位于容器的 `/opt/ignite/work/db`；对应宿主机目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，底层磁盘为挂载在 `/home` 的 `/dev/sdb1`（XFS）。以下记录只对应本次核查节点，不代表其他Ignite节点使用相同目录。
+
+### 目录与磁盘对照
+
+| 内容 | 已核对的位置或信息 |
+| --- | --- |
+| 宿主机 | `AI-slave06` |
+| 宿主机挂载给容器的目录 | `/home/workdir/ignite2/standalone/ignite-data` |
+| 容器内对应目录 | `/opt/ignite/work` |
+| 宿主机持久化数据目录 | `/home/workdir/ignite2/standalone/ignite-data/db` |
+| 容器内持久化数据目录 | `/opt/ignite/work/db` |
+| 本次节点数据子目录 | `node00-e7e19ede-ebc1-440d-92f2-915c019ad86f` |
+| 心跳表及缓存名 | `PUBLIC.HB_STATE` / `HB_STATE` |
+| 心跳缓存文件夹 | 节点数据子目录下的 `cache-HB_STATE` |
+| 底层磁盘 / 文件系统 | `/dev/sdb1` / XFS |
+| 宿主机磁盘挂载点 | `/home` |
+| 核查时磁盘容量 / 已使用 | 约59 TB / 114 GB；这是整个文件系统的统计，不是Ignite单独占用量 |
+
+本次 `HB_STATE` 在宿主机上的完整目录：
+
+```text
+/home/workdir/ignite2/standalone/ignite-data/db/node00-e7e19ede-ebc1-440d-92f2-915c019ad86f/cache-HB_STATE/
+```
+
+该目录中的 `part-*.bin` 是分区数据文件，不是一条心跳一个文件。每梯历史保留上限限制的是逻辑记录数，不意味着这些文件的数量或磁盘占用会随每次覆盖、删除立即减少。
+
+### 现场确认依据与待核实项
+
+- 当时Ignite进程PID为 `114905`，工作目录为 `/opt/ignite`。PID仅用于记录本次取证，进程重启后需重新查找。
+- `/proc/114905/fd/*` 的链接显示运行进程实际打开了 `/opt/ignite/work/db/node00-e7e19ede-ebc1-440d-92f2-915c019ad86f/cache-HB_STATE/part-*.bin`。
+- `df -hT /proc/114905/root/opt/ignite/work/db` 显示底层文件系统为 `/dev/sdb1`、XFS，宿主机挂载点为 `/home`。
+- `/proc/114905/mountinfo` 中根文件系统为Docker overlay；数据挂载行的文件系统内源目录是 `/workdir/ignite2/standalone/ignite-data`，容器挂载点是 `/opt/ignite/work`，设备是 `/dev/sdb1`。结合宿主机 `/home` 挂载点，得到上述宿主机完整路径。
+
+宿主机直接访问 `/opt/ignite/work/db` 曾提示不存在，这是容器内路径与宿主机路径不同所致。宿主机运维应使用 `/home/workdir/ignite2/standalone/ignite-data`。
+
+启动参数中的配置名称为 `config/default-config.xml`；宿主机曾搜索到 `/home/lwh/apache_ignite/ignite-2.18.0/config/default-config.xml`，但尚未证实它就是运行进程加载的配置。WAL、WAL归档的实际目录及 `heartbeat` 区域的服务端配置内容仍未核实，不将默认目录或历史模板当作现场配置。已打开的数据文件及挂载信息确认的是本节点当前的数据落盘位置，不替代重启恢复验证。
+
+### 下次直接查看
+
+在宿主机 `AI-slave06` 执行以下只读命令：
+
+```bash
+# 确认目录及所在磁盘。
+ls -ld /home/workdir/ignite2/standalone/ignite-data/db
+findmnt -T /home/workdir/ignite2/standalone/ignite-data/db
+df -hT /home/workdir/ignite2/standalone/ignite-data/db
+
+# 查看整个Ignite挂载目录的磁盘占用。
+du -sh /home/workdir/ignite2/standalone/ignite-data
+
+# 查找各节点子目录中的心跳缓存文件夹，不依赖旧的节点目录名称。
+find /home/workdir/ignite2/standalone/ignite-data/db \
+  -maxdepth 2 -type d -name 'cache-HB_STATE'
+
+# 需要重新核对运行进程时，先查询当前PID。
+ps -ww -eo pid,args | grep '[o]rg.apache.ignite'
+```
+
+容器重建、挂载调整或节点身份变化后，应重新核对并更新本节。项目中的 `local.properties` 和Flink启动脚本不设置上述服务端存储目录；HDFS历史策略文件、Checkpoint与Savepoint的位置见下节。
+
 ## Checkpoint与Savepoint
 
 | 内容 | 位置与生成方式 |
@@ -293,7 +363,7 @@ yarn logs -applicationId "$FLINK_APP_ID" \
 | Checkpoint | `local.properties` 的 `checkpoint.storage` 决定；当前为 `hdfs:///flink/checkpoints/heartbeat3-reader`，默认每30秒触发 |
 | Savepoint | 代码没有固定默认目录，手动触发时指定；本部署约定使用 `hdfs:///flink/savepoints/heartbeat3-reader` |
 | 历史条数动态配置 | 当前为 `hdfs:///flink/projectConfig/faultRecog/heartbeat-history.properties`，只保存策略，不保存Flink状态或心跳数据 |
-| 心跳业务数据 | 存放在Ignite的 `PUBLIC.HB_STATE`，持久化目录由服务管理员管理 |
+| 心跳业务数据 | 存放在Ignite的 `PUBLIC.HB_STATE`；已核对节点的宿主机数据目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，详见 [Ignite实际持久化目录](#ignite实际持久化目录) |
 
 Checkpoint目录通常包含 `<JobID>/chk-<编号>/`，具体完成检查点的恢复路径以Web UI中Checkpoints页面的External Path为准。代码设置取消后保留外部检查点；这不表示永久保留全部历史检查点，也不表示重新提交时会自动选中旧检查点。修改 `checkpoint.storage` 需要重新提交，运行中的作业使用提交时加载的值。
 

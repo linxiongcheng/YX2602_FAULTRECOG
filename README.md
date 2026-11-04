@@ -6,6 +6,8 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 
 旧表改为查询无需引号的结构，按 [清空重建与重新部署](docs/redeploy-unquoted-columns.md) 执行。
 
+查找服务器数据位置：见 [Ignite实际持久化目录](docs/heartbeat-ignite.md#ignite实际持久化目录)。已核对 `AI-slave06` 的宿主机数据目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，对应容器 `/opt/ignite/work/db`，位于挂载到 `/home` 的 `/dev/sdb1`（XFS）。文档包含心跳表完整目录、核查依据及查看命令。
+
 ## 实现范围
 
 ```text
@@ -65,6 +67,7 @@ src/main/java/com/hitachi/yx2602/heartbeat/
 sql/ignite2-heartbeat.sql        手工建表脚本
 config/reader.example.properties
 bin/watch-history-config.sh     提交节点配置同步入口；共享策略文件由程序自动生成
+bin/start-heartbeat.sh          使用固定集群路径提交YARN Application正式任务
 src/test/java/                  字段、时间、状态恢复、事务、背压、真实Flink/Ignite及打包测试
 ```
 
