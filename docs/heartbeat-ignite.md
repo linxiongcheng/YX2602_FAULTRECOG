@@ -2,6 +2,8 @@
 
 本模块将解析层接受的单梯状态写入 Ignite。Java 编译和运行版本统一为11，Flink保持1.20.5，Ignite客户端和服务端均为2.18.0。业务时间统一使用CreatedDate（北京时间），读取、解析算子UID保持不变。时间规则见 [CreatedDate说明](heartbeat-time.md)。
 
+旧表升级到无需引号的字段结构，请按 [清空重建与重新部署](redeploy-unquoted-columns.md) 操作。必须同时更新建表脚本和JAR，不能只改SQL文件。
+
 ## 正式部署顺序
 
 以下步骤在集群提交节点执行，项目固定放在 `/home/xiong/projects/YX2602_FAULTRECOG`。本项目连接已有Ignite服务，服务端由管理员维护。
@@ -16,7 +18,7 @@
 
 ## 写入契约
 
-所有状态存入一张 `PUBLIC.HB_STATE`，复合主键为 `("EId", SLOT)`。每台电梯的 `SLOT=-1` 固定保存最新状态，非负槽位保存最近N条历史；N默认10，可在1～1000之间配置并在运行中调整。历史包含当前最新状态，因此每梯最多N+1行；累计不足N条时不填充空行。保留的是成功接受的最近N次状态，不是最近10分钟的全部数据。调小上限后，各电梯在下一条新心跳被接受时清理；离线电梯暂时维持原有历史。
+所有状态存入一张 `PUBLIC.HB_STATE`，复合主键为 `(EID, SLOT)`。每台电梯的 `SLOT=-1` 固定保存最新状态，非负槽位保存最近N条历史；N默认10，可在1～1000之间配置并在运行中调整。历史包含当前最新状态，因此每梯最多N+1行；累计不足N条时不填充空行。保留的是成功接受的最近N次状态，不是最近10分钟的全部数据。调小上限后，各电梯在下一条新心跳被接受时清理；离线电梯暂时维持原有历史。
 
 事务使用 Ignite Java thin client 的缓存 API，模式为 `PESSIMISTIC + REPEATABLE_READ`。SQL用于手工建表与查询。每批事务按电梯ID排序获取锁，同一电梯的输入顺序保持不变：
 
@@ -34,7 +36,7 @@
 
 手工执行 [建表脚本](../sql/ignite2-heartbeat.sql)，新建 `PUBLIC.HB_STATE`。本次按新项目部署，不迁移旧表数据、不加载旧项目的Checkpoint/Savepoint。新程序只访问HB_STATE，原有两张表不会被自动读取、修改或删除。已有同名HB_STATE表导致脚本报错时，先核对结构。
 
-业务列遵循《心跳数据摸底情况.docx》中“拆分后实际字段”的41项名称，包括大小写；不添加STATE前缀，也不保留端口数字后缀。SQL定义使用双引号保留名称，查询时也要写 `"EId"`、`"Floor"`、`"MainFaultCode"` 等精确名称。Java解析模型和预览JSON仍使用原有Java字段名，改名范围为数据库列。
+业务列沿用《心跳数据摸底情况.docx》中“拆分后实际字段”的41项拼写，不添加STATE前缀，也不保留端口数字后缀。建表时字段标识符不加双引号，Ignite统一保存为大写；查询可直接写 `eid`、`floor`、`mainfaultcode`，也可以使用混合大小写。Java解析模型、原始Kafka字段和预览JSON继续使用原有名称。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -59,7 +61,7 @@
 
 业务字段使用 `BIGINT` 或 `VARCHAR`，缺失值保持NULL；不补零、不继承旧值。字段与类型的完整清单以SQL脚本为准，`SecDoorCouter`、`TCDOpenDoorRuning` 等名称保留文档既有拼写。文档示例中的空字符串SendTime会保存为NULL，其原始JSON表示保留在SEND_TIME_RAW中，CreatedDate仍然决定新旧、过期和part_day。
 
-缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY='EId'` 放在同一分区。二进制类型为 `HeartbeatStateKeyV1` / `HeartbeatStateRowV1`。启动检查缓存存在性、事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型。程序只访问已有缓存。
+缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV2`。启动检查缓存存在性、事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型。程序只访问已有缓存。
 
 客户端无法仅凭缓存配置证明服务端已开启持久化。`--check-ignite` 的成功只证明连接、ACTIVE状态和上述结构符合要求；服务端持久化和WAL设置由现有服务管理员核实。
 
@@ -362,19 +364,19 @@ grep -nE -B 8 -A 20 \
 SQLLine中可执行：
 
 ```sql
-SELECT "EId", "CreatedDate", DB_SEQUENCE, "Floor", "MainFaultCode", "part_day"
-FROM PUBLIC.HB_STATE WHERE SLOT = -1 ORDER BY "EId" LIMIT 20;
+SELECT eid, createddate, DB_SEQUENCE, floor, mainfaultcode, part_day
+FROM PUBLIC.HB_STATE WHERE SLOT = -1 ORDER BY eid LIMIT 20;
 
-SELECT "EId", SLOT, "CreatedDate", "Floor", "MainFaultCode", DB_SEQUENCE, FLINK_SEQUENCE
-FROM PUBLIC.HB_STATE WHERE "EId" = 12345 AND SLOT >= 0 ORDER BY DB_SEQUENCE;
+SELECT eid, SLOT, createddate, floor, mainfaultcode, DB_SEQUENCE, FLINK_SEQUENCE
+FROM PUBLIC.HB_STATE WHERE eid = 12345 AND SLOT >= 0 ORDER BY DB_SEQUENCE;
 
-SELECT "EId", HISTORY_LIMIT, HISTORY_POLICY_VERSION
-FROM PUBLIC.HB_STATE WHERE SLOT = -1 ORDER BY "EId" LIMIT 20;
+SELECT eid, HISTORY_LIMIT, HISTORY_POLICY_VERSION
+FROM PUBLIC.HB_STATE WHERE SLOT = -1 ORDER BY eid LIMIT 20;
 
-SELECT H."EId", COUNT(*) AS HISTORY_COUNT, L.HISTORY_LIMIT
-FROM PUBLIC.HB_STATE H JOIN PUBLIC.HB_STATE L ON H."EId"=L."EId" AND L.SLOT=-1
+SELECT H.eid, COUNT(*) AS HISTORY_COUNT, L.HISTORY_LIMIT
+FROM PUBLIC.HB_STATE H JOIN PUBLIC.HB_STATE L ON H.eid=L.eid AND L.SLOT=-1
 WHERE H.SLOT >= 0
-GROUP BY H."EId", L.HISTORY_LIMIT HAVING COUNT(*) > L.HISTORY_LIMIT;
+GROUP BY H.eid, L.HISTORY_LIMIT HAVING COUNT(*) > L.HISTORY_LIMIT;
 ```
 
 将12345替换为真实电梯ID，最后一个查询在写入稳定时应返回空结果。查询最新状态必须筛选SLOT=-1，查询或统计历史必须筛选SLOT>=0，避免把最新状态重复计入历史。环形槽位不是时间排序，查询历史必须按DB_SEQUENCE或CREATED_TIME_MS排序。SLOT=-1行的策略字段代表该梯实际已应用配置；子任务指标仅代表已加载目标，离线电梯可能仍使用旧版本。重排时保留的历史行携带原写入时的策略字段，不能用这些旧历史字段判断当前上限。
@@ -383,7 +385,7 @@ GROUP BY H."EId", L.HISTORY_LIMIT HAVING COUNT(*) > L.HISTORY_LIMIT;
 
 时间规则及验证说明见 [CreatedDate说明](heartbeat-time.md)。
 
-单表版本在2026-11-04以Java 11完成 `mvn clean verify`，152项测试通过。业务列名另与原始心跳文档的拆分后字段清单逐项核对，41项名称及大小写一致。三个端口均验证真实解析到SQL查询的字段值、故障码前导零、最新与历史槽位内容一致，以及CreatedDate北京时间跨日时的part_day。
+单表版本在2026-11-04以Java 11完成 `mvn clean verify`，152项测试通过。业务列名另与原始心跳文档的拆分后字段清单逐项核对，41项字段拼写一致（数据库按无引号规则转大写）。三个端口均验证全部41个字段在小写、混合大小写和大写无引号SQL下的查询值、故障码前导零、最新与历史槽位内容一致，以及CreatedDate北京时间跨日时的part_day。
 
 本地测试包含真实Ignite 2.18.0持久化节点、SQL建表、Java thin client和Flink MiniCluster。覆盖空值/前导零、循环历史、数据库与Flink序号分离、重放过滤、同梯并发首次写入、批次中途失败回滚、持久化重启、检查点提交等待、数据库中断后的检查点失败与恢复、队列背压及正常结束刷新。动态配置通过临时本地文件验证后台热加载、10→20→5→1→4扩缩容、离线延迟清理、无效配置保留旧值、旧任务版本保护，以及历史重排与策略元数据的事务回滚。同步程序验证只修改local.properties即可发布并被写入器读取、版本自动递增及重启延续、拒绝重复同步进程、缺少条数或无效配置不覆盖有效文件、生成文件不包含凭据，以及最终JAR独立运行配置发布入口。
 

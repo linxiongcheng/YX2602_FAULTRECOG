@@ -139,16 +139,16 @@ class IgniteStoreTest {
     }
 
     private static void assertHistory(long elevatorId, int from, int to) {
-        List<List<?>> actual = query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=" + elevatorId + " ORDER BY DB_SEQUENCE");
+        List<List<?>> actual = query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT>=0 AND eid=" + elevatorId + " ORDER BY DB_SEQUENCE");
         assertEquals(to - from + 1, actual.size());
         for (int sequence = from; sequence <= to; sequence++) assertEquals((long) sequence, actual.get(sequence - from).get(0));
         // 合并后总行数为N+1，历史扩缩容不能删除或额外复制-1固定槽位。
-        assertEquals((long) actual.size() + 1, query("SELECT COUNT(*) FROM HB_STATE WHERE \"EId\"=" + elevatorId).get(0).get(0));
+        assertEquals((long) actual.size() + 1, query("SELECT COUNT(*) FROM HB_STATE WHERE eid=" + elevatorId).get(0).get(0));
         String columns = "DB_SEQUENCE, CREATED_TIME_MS, HISTORY_LIMIT, HISTORY_POLICY_VERSION";
-        List<List<?>> latest = query("SELECT " + columns + " FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=" + elevatorId);
+        List<List<?>> latest = query("SELECT " + columns + " FROM HB_STATE WHERE SLOT=-1 AND eid=" + elevatorId);
         assertEquals(1, latest.size());
         assertEquals((long) to, latest.get(0).get(0));
-        assertEquals(latest, query("SELECT " + columns + " FROM HB_STATE WHERE SLOT>=0 AND \"EId\"="
+        assertEquals(latest, query("SELECT " + columns + " FROM HB_STATE WHERE SLOT>=0 AND eid="
                 + elevatorId + " AND DB_SEQUENCE=" + to));
     }
 
@@ -193,12 +193,15 @@ class IgniteStoreTest {
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
             assertEquals(1, store.write(rows(update)));
         }
-        String columns = expected.keySet().stream().map(name -> "\"" + name + "\"")
-                .collect(java.util.stream.Collectors.joining(","));
-        List<List<?>> actual = query("SELECT " + columns + " FROM HB_STATE WHERE \"EId\"=773282 ORDER BY SLOT");
-        assertEquals(Arrays.asList(new ArrayList<>(expected.values()), new ArrayList<>(expected.values())), actual);
+        String columns = String.join(",", expected.keySet());
+        String mixedCaseSql = "SELECT " + columns + " FROM HB_STATE WHERE EId=773282 ORDER BY SLOT";
+        List<List<?>> expectedRows = Arrays.asList(new ArrayList<>(expected.values()), new ArrayList<>(expected.values()));
+        // All 41 fields must be readable without quotes in mixed, lower and upper case.
+        assertEquals(expectedRows, query(mixedCaseSql));
+        assertEquals(expectedRows, query(mixedCaseSql.toLowerCase(java.util.Locale.ROOT)));
+        assertEquals(expectedRows, query(mixedCaseSql.toUpperCase(java.util.Locale.ROOT)));
         assertEquals(Arrays.asList(Arrays.asList(-1, port), Arrays.asList(0, port)),
-                query("SELECT SLOT, PORT FROM HB_STATE WHERE \"EId\"=773282 ORDER BY SLOT"));
+                query("SELECT SLOT, PORT FROM HB_STATE WHERE eid=773282 ORDER BY SLOT"));
         assertFalse(server.cacheNames().contains("HB_LATEST"));
         assertFalse(server.cacheNames().contains("HB_HISTORY"));
     }
@@ -215,13 +218,13 @@ class IgniteStoreTest {
             assertHistory(77, 3, 22); // Duplicate data does not trigger lazy cleanup.
             writeRange(store, 77, 23, 23); assertHistory(77, 19, 23);
             assertHistory(88, 3, 12); // No new heartbeat yet.
-            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=77 AND SLOT>=5").get(0).get(0));
+            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=77 AND SLOT>=5").get(0).get(0));
             policyFile(file, 4, 1); awaitPolicy(store, 4);
             writeRange(store, 77, 24, 24); assertHistory(77, 24, 24);
             policyFile(file, 5, 4); awaitPolicy(store, 5);
             writeRange(store, 77, 25, 25); assertHistory(77, 24, 25); // Deleted data cannot be recreated.
             writeRange(store, 77, 26, 28); assertHistory(77, 25, 28);
-            assertEquals(Arrays.asList(4, 5L), query("SELECT HISTORY_LIMIT,HISTORY_POLICY_VERSION FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=77").get(0));
+            assertEquals(Arrays.asList(4, 5L), query("SELECT HISTORY_LIMIT,HISTORY_POLICY_VERSION FROM HB_STATE WHERE SLOT=-1 AND eid=77").get(0));
             writeRange(store, 88, 13, 13); assertHistory(88, 10, 13);
         }
     }
@@ -236,7 +239,7 @@ class IgniteStoreTest {
             writeRange(fast, 77, 13, 13);
             writeRange(slow, 77, 14, 14);
             assertHistory(77, 10, 14);
-            assertEquals(Arrays.asList(5, 2L), query("SELECT HISTORY_LIMIT,HISTORY_POLICY_VERSION FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=77").get(0));
+            assertEquals(Arrays.asList(5, 2L), query("SELECT HISTORY_LIMIT,HISTORY_POLICY_VERSION FROM HB_STATE WHERE SLOT=-1 AND eid=77").get(0));
         }
     }
 
@@ -244,11 +247,11 @@ class IgniteStoreTest {
         Path file = directory.resolve("rollback-policy.properties"); policyFile(file, 1, 10);
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(dynamicConfig(file))) {
             writeRange(store, 1, 1, 12); writeRange(store, 2, 1, 1);
-            query("UPDATE HB_STATE SET DB_SEQUENCE=" + Long.MAX_VALUE + " WHERE \"EId\"=2 AND SLOT=-1");
+            query("UPDATE HB_STATE SET DB_SEQUENCE=" + Long.MAX_VALUE + " WHERE eid=2 AND SLOT=-1");
             policyFile(file, 2, 2); awaitPolicy(store, 2);
             assertThrows(ArithmeticException.class, () -> store.write(rows(update(1, 13, 13), update(2, 2, 2))));
             assertHistory(1, 3, 12);
-            assertEquals(Arrays.asList(12L, 10, 1L), query("SELECT DB_SEQUENCE,HISTORY_LIMIT,HISTORY_POLICY_VERSION FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=1").get(0));
+            assertEquals(Arrays.asList(12L, 10, 1L), query("SELECT DB_SEQUENCE,HISTORY_LIMIT,HISTORY_POLICY_VERSION FROM HB_STATE WHERE SLOT=-1 AND eid=1").get(0));
             writeRange(store, 1, 13, 13); assertHistory(1, 12, 13);
         }
     }
@@ -274,9 +277,9 @@ class IgniteStoreTest {
             // A restored Flink checkpoint has lower sequence values and replays already committed input.
             assertEquals(0, store.write(rows(update(77, 12, 3), update(77, 8, 4))));
             assertEquals(Arrays.asList(12L, 12L, 912L, "0007", null),
-                    query("SELECT CREATED_TIME_MS, DB_SEQUENCE, FLINK_SEQUENCE, \"MainFaultCode\", \"Speed\" "
-                            + "FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=77").get(0));
-            List<List<?>> history = query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=77 ORDER BY DB_SEQUENCE");
+                    query("SELECT CREATED_TIME_MS, DB_SEQUENCE, FLINK_SEQUENCE, mainfaultcode, speed "
+                            + "FROM HB_STATE WHERE SLOT=-1 AND eid=77").get(0));
+            List<List<?>> history = query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT>=0 AND eid=77 ORDER BY DB_SEQUENCE");
             assertEquals(10, history.size());
             assertEquals(3L, history.get(0).get(0));
             assertEquals(12L, history.get(9).get(0));
@@ -290,12 +293,12 @@ class IgniteStoreTest {
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
             store.write(rows(update(2, 1, 1)));
             // Force a real mid-transaction failure after elevator 1 has been staged.
-            query("UPDATE HB_STATE SET DB_SEQUENCE=" + Long.MAX_VALUE + " WHERE \"EId\"=2 AND SLOT=-1");
+            query("UPDATE HB_STATE SET DB_SEQUENCE=" + Long.MAX_VALUE + " WHERE eid=2 AND SLOT=-1");
             assertThrows(ArithmeticException.class, () -> store.write(rows(update(1, 2, 1), update(2, 2, 2))));
-            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=1").get(0).get(0));
-            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=1").get(0).get(0));
-            assertEquals(1L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=2").get(0).get(0));
-            assertEquals(1L, query("SELECT MAX(DB_SEQUENCE) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=2").get(0).get(0));
+            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT=-1 AND eid=1").get(0).get(0));
+            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=1").get(0).get(0));
+            assertEquals(1L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND eid=2").get(0).get(0));
+            assertEquals(1L, query("SELECT MAX(DB_SEQUENCE) FROM HB_STATE WHERE SLOT>=0 AND eid=2").get(0).get(0));
         }
     }
 
@@ -314,8 +317,8 @@ class IgniteStoreTest {
             duplicate.sendTimeMs = Long.MAX_VALUE;
             assertEquals(0, store.write(rows(duplicate)));
             assertEquals(Arrays.asList(200L, null, "\"\"", 2L), query(
-                    "SELECT CREATED_TIME_MS, \"SendTime\", SEND_TIME_RAW, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=66").get(0));
-            assertEquals(2L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=66").get(0).get(0));
+                    "SELECT CREATED_TIME_MS, sendtime, SEND_TIME_RAW, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=66").get(0));
+            assertEquals(2L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=66").get(0).get(0));
         }
     }
 
@@ -332,10 +335,10 @@ class IgniteStoreTest {
             }));
         }
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
-        List<?> latest = query("SELECT CREATED_TIME_MS, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=88").get(0);
+        List<?> latest = query("SELECT CREATED_TIME_MS, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=88").get(0);
         assertEquals(2L, latest.get(0));
-        assertEquals(latest.get(1), query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=88").get(0).get(0));
-        assertEquals(latest.get(1), query("SELECT MAX(DB_SEQUENCE) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=88").get(0).get(0));
+        assertEquals(latest.get(1), query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=88").get(0).get(0));
+        assertEquals(latest.get(1), query("SELECT MAX(DB_SEQUENCE) FROM HB_STATE WHERE SLOT>=0 AND eid=88").get(0).get(0));
     }
 
     @Test void durableRestartKeepsLatestAndHistorySlotsAndExistingClientCanReconnect() throws Exception {
@@ -343,11 +346,11 @@ class IgniteStoreTest {
             store.write(rows(update(99, 1, 1)));
             server.close();
             startServer();
-            assertEquals(1L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=99").get(0).get(0));
-            assertEquals(1L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=99").get(0).get(0));
+            assertEquals(1L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
+            assertEquals(1L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=99").get(0).get(0));
             assertEquals(0, store.write(rows(update(99, 1, 1))));
             assertEquals(1, store.write(rows(update(99, 2, 2))));
-            assertEquals(2L, query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=99").get(0).get(0));
+            assertEquals(2L, query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
         }
     }
 
@@ -360,7 +363,7 @@ class IgniteStoreTest {
         config.setAtomicityMode(CacheAtomicityMode.ATOMIC);
         assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
         config.setAtomicityMode(CacheAtomicityMode.TRANSACTIONAL);
-        config.getQueryEntities()[0].getFields().remove("Speed");
+        config.getQueryEntities()[0].getFields().remove("SPEED");
         assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
     }
 
@@ -388,7 +391,7 @@ class IgniteStoreTest {
             harness.open();
             harness.processElement(new org.apache.flink.streaming.runtime.streamrecord.StreamRecord<>(update(44, 1, 1)));
             snapshot = harness.snapshot(1, 1);
-            assertEquals(1L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=44").get(0).get(0));
+            assertEquals(1L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=44").get(0).get(0));
             server.close();
             assertThrows(Exception.class, () -> {
                 harness.processElement(new org.apache.flink.streaming.runtime.streamrecord.StreamRecord<>(update(44, 2, 2)));
@@ -402,8 +405,8 @@ class IgniteStoreTest {
             restored.processElement(new org.apache.flink.streaming.runtime.streamrecord.StreamRecord<>(update(44, 1, 1)));
             restored.processElement(new org.apache.flink.streaming.runtime.streamrecord.StreamRecord<>(update(44, 2, 2)));
             restored.snapshot(3, 3);
-            assertEquals(Arrays.asList(2L, 2L), query("SELECT CREATED_TIME_MS, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND \"EId\"=44").get(0));
-            assertEquals(2L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND \"EId\"=44").get(0).get(0));
+            assertEquals(Arrays.asList(2L, 2L), query("SELECT CREATED_TIME_MS, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=44").get(0));
+            assertEquals(2L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=44").get(0).get(0));
         }
     }
 

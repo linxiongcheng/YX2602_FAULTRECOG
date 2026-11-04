@@ -27,14 +27,14 @@
 
 按新项目设计，不实现旧SendTime版本状态迁移。Flink状态类为 `CreatedVersion`，状态名为 `last-accepted-created-version-v1`，每梯序号从1开始。后续本项目的检查点/保存点可以恢复CreatedDate基准和序号。
 
-数据库使用 [建表脚本](../sql/ignite2-heartbeat.sql) 中的单表 `PUBLIC.HB_STATE`，每梯SLOT=-1保存最新状态，SLOT>=0保存默认最多10条历史；保留条数支持热更新，调小后在该梯下一条新心跳被接受时事务内清理，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。`CREATED_TIME_MS` 是比较依据，`"CreatedDate"` 保留日期文本，`"part_day"` 是按北京时间生成的yyyy-MM-dd日期。`"SendTime"` 和 `SEND_TIME_RAW` 仅用于追踪。数据库独立维护DB_SEQUENCE，不使用Flink序号决定历史槽位。
+数据库使用 [建表脚本](../sql/ignite2-heartbeat.sql) 中的单表 `PUBLIC.HB_STATE`，每梯SLOT=-1保存最新状态，SLOT>=0保存默认最多10条历史；保留条数支持热更新，调小后在该梯下一条新心跳被接受时事务内清理，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。`CREATED_TIME_MS` 是比较依据，`createddate` 保留日期文本，`part_day` 是按北京时间生成的yyyy-MM-dd日期。`sendtime` 和 `SEND_TIME_RAW` 仅用于追踪。数据库独立维护DB_SEQUENCE，不使用Flink序号决定历史槽位。
 
 首次部署执行当前建表脚本，按 [YARN Application部署说明](heartbeat-ignite.md#yarn-application正式运行) 提交，不携带旧项目保存点。应用不自动建表或修改既有表结构；同名表结构不匹配时预检会明确报错。
 
 ```sql
-SELECT "EId", "CreatedDate", CREATED_TIME_MS, "part_day",
-       "SendTime", SEND_TIME_RAW, DB_SEQUENCE, FLINK_SEQUENCE
-FROM PUBLIC.HB_STATE WHERE SLOT = -1 ORDER BY "EId" LIMIT 20;
+SELECT eid, createddate, CREATED_TIME_MS, part_day,
+       sendtime, SEND_TIME_RAW, DB_SEQUENCE, FLINK_SEQUENCE
+FROM PUBLIC.HB_STATE WHERE SLOT = -1 ORDER BY eid LIMIT 20;
 ```
 
 日期解析、空SendTime、两种时间顺序冲突、10分钟边界、未来60秒边界、CreatedDate状态恢复，以及真实Ignite的新旧判断均有自动化测试。内网Kafka/YARN和吞吐量需在集群验收。

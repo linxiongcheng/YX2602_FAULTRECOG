@@ -79,7 +79,7 @@
 
 固定算子UID为 `heartbeat-split-v1`、`heartbeat-elevator-ordering-v1`、`heartbeat-parser-error-kafka-v1`；状态名为 `last-accepted-created-version-v1`，使用CreatedVersion保存业务时间和序号。`parser.max.parallelism` 默认128，已有保存点后不要随意修改。正常并行度可以在该上限内调整，实际集群扩缩容仍需验证。
 
-存储模块使用一条输出同时构造最新状态和历史写入，不会为两种写入分别递增序号。两种状态存入同一张 `PUBLIC.HB_STATE`：SLOT=-1为最新状态，其余非负槽位为历史。数据库独立维护DB_SEQUENCE，按 `(DB_SEQUENCE - 1) % N` 定位历史槽位；N默认为10，支持通过共享配置热更新，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。使用EId和CreatedDate对应的时间进行幂等判断。Flink的historySequence仅作追踪，不能作为数据库历史槽位依据。数据库业务列使用文档原名（如 `"EId"`、`"ACD"`、`"CreatedDate"`），内部Java模型和预览JSON字段名称沿用本说明。
+存储模块使用一条输出同时构造最新状态和历史写入，不会为两种写入分别递增序号。两种状态存入同一张 `PUBLIC.HB_STATE`：SLOT=-1为最新状态，其余非负槽位为历史。数据库独立维护DB_SEQUENCE，按 `(DB_SEQUENCE - 1) % N` 定位历史槽位；N默认为10，支持通过共享配置热更新，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。使用EId和CreatedDate对应的时间进行幂等判断。Flink的historySequence仅作追踪，不能作为数据库历史槽位依据。数据库业务列沿用文档拼写并按无引号SQL标识符规则转大写，查询直接使用 `eid`、`acd`、`createddate` 即可；内部Java模型和预览JSON字段名称沿用本说明。
 
 ## 解析异常
 

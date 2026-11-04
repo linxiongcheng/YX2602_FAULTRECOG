@@ -47,7 +47,7 @@ class AsyncHeartbeatWriterTest {
             release.countDown();
             snapshot.get(5, TimeUnit.SECONDS);
             assertEquals(1, committed.get(0).elevatorId);
-            assertEquals(7L, committed.get(0).values.get("Speed"));
+            assertEquals(7L, committed.get(0).values.get("SPEED"));
         } finally { release.countDown(); }
     }
 

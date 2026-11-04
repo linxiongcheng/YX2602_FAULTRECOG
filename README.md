@@ -4,6 +4,8 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 
 正式上线从 [部署执行顺序](docs/heartbeat-ignite.md#正式部署顺序) 开始，包含已有Ignite服务接入、Java 11的YARN容器参数、动态配置同步、提交与验收、Checkpoint/Savepoint目录及停止恢复命令，以及AM启动失败排查。
 
+旧表改为查询无需引号的结构，按 [清空重建与重新部署](docs/redeploy-unquoted-columns.md) 执行。
+
 ## 实现范围
 
 ```text
@@ -36,7 +38,7 @@ Kafka 原始心跳（bytes，保留来源坐标）
 
 按新项目首次部署：执行当前建表脚本创建 `PUBLIC.HB_STATE`，不迁移旧数据、不加载旧项目的Checkpoint/Savepoint。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
 
-存储使用一张 `HB_STATE` 表：主键为 `("EId", SLOT)`，`SLOT=-1` 是最新状态，`SLOT>=0` 是最近N条历史，每梯最多N+1行。业务列采用心跳文档中拆分后的41个字段名称和大小写，例如 `"EId"`、`"Floor"`、`"MainFaultCode"`、`"CreatedDate"`；`"part_day"` 按CreatedDate的北京时间日期生成。查询业务列须使用双引号，查历史须过滤掉SLOT=-1。完整查询示例见 [存储说明](docs/heartbeat-ignite.md#检查点重试与运维)。
+存储使用一张 `HB_STATE` 表：主键为 `(EID, SLOT)`，`SLOT=-1` 是最新状态，`SLOT>=0` 是最近N条历史，每梯最多N+1行。业务列沿用心跳文档中拆分后的41个字段拼写，建表不加字段双引号，Ignite统一保存为大写；查询直接写 `eid`、`floor`、`mainfaultcode`、`createddate` 即可。`part_day` 按CreatedDate的北京时间日期生成。查历史须过滤掉SLOT=-1。完整查询示例见 [存储说明](docs/heartbeat-ignite.md#检查点重试与运维)。
 
 ## 工程结构
 

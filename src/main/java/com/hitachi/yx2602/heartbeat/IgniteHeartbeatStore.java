@@ -27,6 +27,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -148,7 +149,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
 
     private BinaryObject stateKey(long elevatorId, int slot) {
         return client.binary().builder(Schema.KEY_TYPE)
-                .setField("EId", elevatorId, Long.class)
+                .setField("EID", elevatorId, Long.class)
                 .setField("SLOT", slot, Integer.class).build();
     }
 
@@ -188,13 +189,13 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     static final class Schema {
         static final String CACHE = "HB_STATE", REGION = "heartbeat";
         static final int LATEST_SLOT = -1;
-        static final String VALUE_TYPE = "HeartbeatStateRowV1", KEY_TYPE = "HeartbeatStateKeyV1";
+        static final String VALUE_TYPE = "HeartbeatStateRowV2", KEY_TYPE = "HeartbeatStateKeyV2";
         static final Map<String, Field> STATE_FIELDS;
         static final Map<String, Class<?>> VALUE_FIELDS;
 
         static {
             Map<String, Field> stateFields = new LinkedHashMap<>();
-            // 左侧严格使用《心跳数据摸底情况》拆分后字段名；右侧保留解析模型的Java字段名。
+            // 左侧保留文档拼写，再按无引号SQL标识符规则转大写；右侧为解析模型的Java字段名。
             String names = "IntId:intId FId:fId Code:code Floor:floor ACD:acd Direction:direction RS:rs "
                     + "DoorLock:doorLock IsActive:isActive IsDebug:isDebug IsRepair:isRepair IsPower:isPower "
                     + "IsDoor:isDoor IsHardware:isHardware IsCall:isCall RunTotal:runTotal RunTime:runTime "
@@ -207,14 +208,14 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             try {
                 for (String name : names.split(" ")) {
                     String[] mapping = name.split(":");
-                    stateFields.put(mapping[0], ElevatorState.class.getField(mapping[1]));
+                    stateFields.put(mapping[0].toUpperCase(Locale.ROOT), ElevatorState.class.getField(mapping[1]));
                 }
             } catch (NoSuchFieldException e) { throw new ExceptionInInitializerError(e); }
             STATE_FIELDS = Collections.unmodifiableMap(stateFields);
             Map<String, Class<?>> valueFields = new LinkedHashMap<>();
             valueFields.put("PORT", Integer.class);
-            valueFields.put("SendTime", Long.class);
-            valueFields.put("part_day", String.class);
+            valueFields.put("SENDTIME", Long.class);
+            valueFields.put("PART_DAY", String.class);
             valueFields.put("SEND_TIME_RAW", String.class);
             valueFields.put("CREATED_TIME_MS", Long.class);
             valueFields.put("FLINK_SEQUENCE", Long.class);
@@ -255,14 +256,14 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             require(VALUE_TYPE.equals(entity.getValueType()), name, "VALUE_TYPE=" + VALUE_TYPE);
             require(KEY_TYPE.equals(entity.getKeyType()), name, "KEY_TYPE=" + KEY_TYPE);
             Map<String, String> expected = new LinkedHashMap<>();
-            expected.put("EId", Long.class.getName());
+            expected.put("EID", Long.class.getName());
             expected.put("SLOT", Integer.class.getName());
             VALUE_FIELDS.forEach((column, type) -> expected.put(column, type.getName()));
             require(expected.equals(entity.getFields()), name, "字段名称、大小写及类型，须与HB_STATE建表脚本完全一致");
             if (entity.getNotNullFields() != null) {
                 require(Collections.disjoint(entity.getNotNullFields(), STATE_FIELDS.keySet()), name, "业务字段必须允许NULL");
             }
-            require(new HashSet<>(Arrays.asList("EId", "SLOT")).equals(entity.getKeyFields()), name, "复合主键(EId,SLOT)");
+            require(new HashSet<>(Arrays.asList("EID", "SLOT")).equals(entity.getKeyFields()), name, "复合主键(EID,SLOT)");
             if (entity.getAliases() != null) entity.getAliases().forEach((field, alias) ->
                     require(Objects.equals(field, alias), name, "禁止修改字段别名"));
         }
@@ -286,8 +287,8 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             createdTimeMs = update.createdTimeMs;
             Map<String, Object> fields = new LinkedHashMap<>();
             fields.put("PORT", update.port);
-            fields.put("SendTime", update.sendTimeMs);
-            fields.put("part_day", Instant.ofEpochMilli(createdTimeMs)
+            fields.put("SENDTIME", update.sendTimeMs);
+            fields.put("PART_DAY", Instant.ofEpochMilli(createdTimeMs)
                     .atZone(ZoneId.of("Asia/Shanghai")).toLocalDate().toString());
             fields.put("SEND_TIME_RAW", update.sendTimeRaw);
             fields.put("CREATED_TIME_MS", update.createdTimeMs);
