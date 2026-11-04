@@ -29,7 +29,7 @@ public final class PackagedIgniteClient {
         }
         try (IgniteClient client = Ignition.startClient(new ClientConfiguration().setAddresses(args[0]));
              org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = client.query(new SqlFieldsQuery(
-                     "SELECT DB_SEQUENCE, FLINK_SEQUENCE, STATE_MAIN_FAULT_CODE, STATE_SPEED FROM PUBLIC.HB_LATEST WHERE ELEVATOR_ID=123"))) {
+                     "SELECT DB_SEQUENCE, FLINK_SEQUENCE, \"MainFaultCode\", \"Speed\" FROM PUBLIC.HB_STATE WHERE SLOT=-1 AND \"EId\"=123"))) {
             if (!java.util.Arrays.asList(1L, 99L, "0008", null).equals(cursor.getAll().get(0))) {
                 throw new AssertionError("packaged SQL mapping");
             }

@@ -2,6 +2,8 @@
 
 Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式校验、分梯、字段规范化、10分钟过期过滤及按电梯判断新旧，输出带历史序号的单梯状态。读取和解析异常都可靠写入配置的异常Topic。解析规则与字段映射详见 [解析模块说明](docs/heartbeat-parser.md)。正式写入与部署详见 [Ignite 模块说明](docs/heartbeat-ignite.md)。
 
+正式上线从 [部署执行顺序](docs/heartbeat-ignite.md#正式部署顺序) 开始，包含已有Ignite服务接入、Java 11的YARN容器参数、动态配置同步、提交与验收、Checkpoint/Savepoint目录及停止恢复命令，以及AM启动失败排查。
+
 ## 实现范围
 
 ```text
@@ -32,7 +34,9 @@ Kafka 原始心跳（bytes，保留来源坐标）
 
 **业务时间只取CreatedDate，时区固定为北京时间（Asia/Shanghai）。** 例如 `2026/1/22 17:56:17` 对应UTC `2026-01-22T09:56:17Z`，不受JVM默认时区影响。缺失、空值或非法日期写异常Topic，不回退到SendTime、Kafka时间或接收时间。同梯CreatedDate相同仍按重复过滤；上游只提供秒精度时，同一秒最多接受一条。平台时钟用于超前与过期判断，需要节点时钟同步。
 
-按新项目首次部署：执行当前建表脚本，不加载旧SendTime版本保存点。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
+按新项目首次部署：执行当前建表脚本创建 `PUBLIC.HB_STATE`，不迁移旧数据、不加载旧项目的Checkpoint/Savepoint。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
+
+存储使用一张 `HB_STATE` 表：主键为 `("EId", SLOT)`，`SLOT=-1` 是最新状态，`SLOT>=0` 是最近N条历史，每梯最多N+1行。业务列采用心跳文档中拆分后的41个字段名称和大小写，例如 `"EId"`、`"Floor"`、`"MainFaultCode"`、`"CreatedDate"`；`"part_day"` 按CreatedDate的北京时间日期生成。查询业务列须使用双引号，查历史须过滤掉SLOT=-1。完整查询示例见 [存储说明](docs/heartbeat-ignite.md#检查点重试与运维)。
 
 ## 工程结构
 
@@ -82,13 +86,13 @@ mvn -B -ntp clean verify
 
 测试中的本地Flink MiniCluster实际运行读取校验、解析、keyBy和侧输出；算子测试通过快照与恢复验证历史序号延续。测试不连接真实Kafka，不能替代Kafka断网、Broker重启、YARN恢复或性能压测。
 
-2026-11-03在Java 11下执行 `mvn clean verify`：149项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate规则、Flink状态恢复、真实Ignite事务/持久化、动态配置后台刷新、历史扩缩容、离线延迟清理、策略版本保护及事务回滚。同步程序另验证只修改local.properties即可发布、版本自动管理、无效配置保护及凭据隔离；最终JAR经独立Java进程验证配置发布、数据库写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS发布和读取、内网Kafka/YARN及吞吐量仍需集群验收。
+2026-11-04在Java 11下执行 `mvn clean verify`：152项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate规则、Flink状态恢复、真实Ignite单表事务/持久化、动态配置后台刷新、历史扩缩容、离线延迟清理、策略版本保护及事务回滚。新增三个端口从解析到SQL存储的41个文档字段验证，以及最新/历史槽位隔离、N+1行数和北京时间跨日的part_day验证。同步程序验证只修改local.properties即可发布、版本自动管理、无效配置保护及凭据隔离；最终JAR经独立Java进程验证配置发布、数据库写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS发布和读取、内网Kafka/YARN及吞吐量仍需集群验收。
 
 ## 配置
 
 复制 `config/reader.example.properties` 为 `config/local.properties`。配置按 UTF-8 读取。可以填写真实值，也可以通过 `${ENV_NAME}` 使用提交进程的环境变量。缺少变量、未知配置键、相同输入/异常Topic、非法阈值会在提交前报错，不打印凭据。
 
-历史保留条数默认10，在 `local.properties` 中设置 `max.records=10`。需要运行中自动生效时，启用 `ignite.history.config.path=hdfs:///flink/config/heartbeat-history.properties`，在提交节点运行 [配置同步脚本](bin/watch-history-config.sh)。程序监视原始 `local.properties`，自动生成并更新HDFS动态文件、管理版本号；以后只改 `max.records`，不需要填写 `version` 或手动上传文件。同步与容器刷新默认各10秒，无需重启Flink；调小后在各梯下一条新心跳被接受时事务内清理，离线梯暂不清理。完整命令、配置边界及生效查询见 [历史条数热更新](docs/heartbeat-ignite.md#历史条数热更新)。旧键 `ignite.history.max.records` 仍兼容，但不能与 `max.records` 同时配置。
+历史保留条数默认10，在 `local.properties` 中设置 `max.records=10`。需要运行中自动生效时，启用 `ignite.history.config.path=hdfs:///flink/projectConfig/faultRecog/heartbeat-history.properties`，在提交节点运行 [配置同步脚本](bin/watch-history-config.sh)。程序监视原始 `local.properties`，自动生成并更新HDFS动态文件、管理版本号；以后只改 `max.records`，不需要填写 `version` 或手动上传文件。同步与容器刷新默认各10秒，无需重启Flink；调小后在各梯下一条新心跳被接受时事务内清理，离线梯暂不清理。完整命令、配置边界及生效查询见 [历史条数热更新](docs/heartbeat-ignite.md#历史条数热更新)。旧键 `ignite.history.max.records` 仍兼容，但不能与 `max.records` 同时配置。
 
 ```bash
 export HEARTBEAT_KAFKA_BOOTSTRAP='broker1:9092,broker2:9092'
@@ -218,6 +222,8 @@ java -cp '/home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.j
 /opt/flink-1.20.5/bin/flink run-application \
   -t yarn-application \
   -Denv.java.home=/opt/java11 \
+  -Dcontainerized.master.env.JAVA_HOME=/opt/java11 \
+  -Dcontainerized.taskmanager.env.JAVA_HOME=/opt/java11 \
   -Dclassloader.parent-first-patterns.additional=org.apache.kafka. \
   -Dyarn.application.name=yx2602-heartbeat-reader-preview \
   -Djobmanager.memory.process.size=1024m \
@@ -228,6 +234,8 @@ java -cp '/home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.j
   /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
   --config local.properties --preview
 ```
+
+所有可能运行容器的节点均须存在 `/opt/java11/bin/java`，且版本为Java 11。两个 `containerized.*.env.JAVA_HOME` 参数分别设置AM/JobManager和TaskManager容器的环境；仅设置提交终端的JAVA_HOME或 `env.java.home` 不能保证容器使用Java 11。
 
 资源配置为小规模联调起点。代码从配置文件的 `parallelism` 读取并行度，示例为2。指定队列时，在JAR路径之前添加 `-Dyarn.application.queue=实际队列名`。首次提交不传 `yarn.application.id`；它由YARN创建后返回。
 

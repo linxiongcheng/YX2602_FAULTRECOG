@@ -79,7 +79,7 @@
 
 固定算子UID为 `heartbeat-split-v1`、`heartbeat-elevator-ordering-v1`、`heartbeat-parser-error-kafka-v1`；状态名为 `last-accepted-created-version-v1`，使用CreatedVersion保存业务时间和序号。`parser.max.parallelism` 默认128，已有保存点后不要随意修改。正常并行度可以在该上限内调整，实际集群扩缩容仍需验证。
 
-存储模块使用一条输出同时构造最新状态和历史写入，不会为两种写入分别递增序号。数据库独立维护DB_SEQUENCE，按 `(DB_SEQUENCE - 1) % N` 定位历史槽位；N默认为10，支持通过共享配置热更新，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。使用EId和CreatedDate对应的时间进行幂等判断。Flink的historySequence仅作追踪，不能作为数据库历史槽位依据。
+存储模块使用一条输出同时构造最新状态和历史写入，不会为两种写入分别递增序号。两种状态存入同一张 `PUBLIC.HB_STATE`：SLOT=-1为最新状态，其余非负槽位为历史。数据库独立维护DB_SEQUENCE，按 `(DB_SEQUENCE - 1) % N` 定位历史槽位；N默认为10，支持通过共享配置热更新，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。使用EId和CreatedDate对应的时间进行幂等判断。Flink的historySequence仅作追踪，不能作为数据库历史槽位依据。数据库业务列使用文档原名（如 `"EId"`、`"ACD"`、`"CreatedDate"`），内部Java模型和预览JSON字段名称沿用本说明。
 
 ## 解析异常
 
@@ -116,6 +116,8 @@ export PATH=/opt/java11/bin:$PATH
 /opt/flink-1.20.5/bin/flink run-application \
   -t yarn-application \
   -Denv.java.home=/opt/java11 \
+  -Dcontainerized.master.env.JAVA_HOME=/opt/java11 \
+  -Dcontainerized.taskmanager.env.JAVA_HOME=/opt/java11 \
   -Dyarn.application.name=yx2602-heartbeat-parser-preview \
   -Djobmanager.memory.process.size=1024m \
   -Dtaskmanager.memory.process.size=2048m \
@@ -145,6 +147,6 @@ export PATH=/opt/java11/bin:$PATH
 
 测试覆盖第一/第三台正常而第二台异常、数字字符串、前导零故障码、可空字段、非法范围、异常原文恢复、重复ID、10分钟边界、过期过滤不进异常Topic、重复/乱序不增序号、独立电梯编号、检查点恢复与长期离线后继续编号，以及真实本地Flink运行。
 
-2026-11-03在Java 11下执行 `mvn clean verify`：149项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate规则、Flink状态恢复、真实Ignite事务/持久化、动态配置后台刷新、历史扩缩容、离线延迟清理、策略版本保护及事务回滚。同步程序另验证只修改local.properties即可发布、版本自动管理、无效配置保护及凭据隔离；最终JAR经独立Java进程验证配置发布、数据库写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS发布和读取、内网Kafka/YARN及吞吐量仍需集群验收。
+2026-11-04在Java 11下执行 `mvn clean verify`：152项测试全部通过，失败、错误和跳过均为0。覆盖CreatedDate规则、Flink状态恢复、真实Ignite单表事务/持久化、动态配置后台刷新、历史扩缩容、离线延迟清理、策略版本保护及事务回滚。新增三个端口从解析到SQL存储的41个文档字段验证，以及最新/历史槽位隔离、N+1行数和北京时间跨日的part_day验证。同步程序验证只修改local.properties即可发布、版本自动管理、无效配置保护及凭据隔离；最终JAR经独立Java进程验证配置发布、数据库写入与SQL查询，应用class版本为55。热加载测试使用本地临时文件；HDFS发布和读取、内网Kafka/YARN及吞吐量仍需集群验收。
 
 尚未在真实Kafka/YARN集群运行本版，也未验证10万条/秒。集群验收应检查解析输出、错误Topic、上述指标、保存点恢复，以及持久化链路的端到端一致性。

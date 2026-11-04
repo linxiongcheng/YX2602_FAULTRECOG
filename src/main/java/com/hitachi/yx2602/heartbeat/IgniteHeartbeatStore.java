@@ -18,6 +18,8 @@ import org.apache.ignite.transactions.TransactionConcurrency;
 import org.apache.ignite.transactions.TransactionIsolation;
 
 import java.lang.reflect.Field;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -25,7 +27,6 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -35,8 +36,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     private final IgniteConfig config;
     private final IgniteConfig.HistorySettings historySettings;
     private IgniteClient client;
-    private ClientCache<Long, BinaryObject> latest;
-    private ClientCache<BinaryObject, BinaryObject> history;
+    private ClientCache<BinaryObject, BinaryObject> states;
 
     IgniteHeartbeatStore(IgniteConfig config) {
         this.config = config;
@@ -60,8 +60,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                 throw new IllegalStateException("Ignite集群必须处于ACTIVE可写状态");
             }
             Schema.validate(client);
-            latest = client.<Long, BinaryObject>cache(Schema.LATEST).withKeepBinary();
-            history = client.<BinaryObject, BinaryObject>cache(Schema.HISTORY).withKeepBinary();
+            states = client.<BinaryObject, BinaryObject>cache(Schema.CACHE).withKeepBinary();
         } catch (RuntimeException e) { disconnect(); throw e; }
     }
 
@@ -92,7 +91,8 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                 TransactionIsolation.REPEATABLE_READ, config.transactionTimeoutMs)) {
             for (Row row : rows) {
                 // 悲观事务的可重复读也锁定不存在的键，避免并发首次写入都取得序号 1。
-                BinaryObject previous = latest.get(row.elevatorId);
+                BinaryObject latestKey = stateKey(row.elevatorId, Schema.LATEST_SLOT);
+                BinaryObject previous = states.get(latestKey);
                 // 数据库再次比较 CreatedDate，拦截检查点恢复重放以及事务重试产生的重复或旧数据。
                 if (previous != null && row.createdTimeMs <= (Long) previous.field("CREATED_TIME_MS")) continue;
                 // 数据库序号独立递增，不依赖 Flink 恢复后的序号。
@@ -102,10 +102,10 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                     resizeHistory(row.elevatorId, (Integer) previous.field("HISTORY_LIMIT"), effective.maxRecords);
                 }
                 BinaryObject value = value(row, sequence, effective);
-                BinaryObject key = historyKey(row.elevatorId, (int) ((sequence - 1) % effective.maxRecords));
-                // 最新状态、历史槽位及序号在同一事务中提交，避免两张表只成功更新一张。
-                latest.put(row.elevatorId, value);
-                history.put(key, value);
+                BinaryObject key = stateKey(row.elevatorId, (int) ((sequence - 1) % effective.maxRecords));
+                // 同一缓存中，-1固定槽位与历史槽位、序号一起提交，避免只更新部分状态。
+                states.put(latestKey, value);
+                states.put(key, value);
                 accepted++;
             }
             tx.commit();
@@ -130,8 +130,9 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     private void resizeHistory(long elevatorId, int oldLimit, int newLimit) {
         IgniteConfig.historyLimit(oldLimit);
         Set<BinaryObject> oldKeys = new HashSet<>();
-        for (int slot = 0; slot < oldLimit; slot++) oldKeys.add(historyKey(elevatorId, slot));
-        List<BinaryObject> retained = new ArrayList<>(history.getAll(oldKeys).values());
+        // 只调整非负历史槽位，始终保留用于串行化同梯事务的-1固定槽位。
+        for (int slot = 0; slot < oldLimit; slot++) oldKeys.add(stateKey(elevatorId, slot));
+        List<BinaryObject> retained = new ArrayList<>(states.getAll(oldKeys).values());
         retained.sort(Comparator.comparingLong(value -> (Long) value.field("DB_SEQUENCE")));
         // 为即将写入的新记录预留一格。先取出最近的记录，再按新上限重排槽位，避免直接改取模造成误覆盖。
         int from = Math.max(0, retained.size() - (newLimit - 1));
@@ -139,15 +140,15 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
         for (int index = from; index < retained.size(); index++) {
             BinaryObject value = retained.get(index);
             long sequence = value.field("DB_SEQUENCE");
-            replacement.put(historyKey(elevatorId, (int) ((sequence - 1) % newLimit)), value);
+            replacement.put(stateKey(elevatorId, (int) ((sequence - 1) % newLimit)), value);
         }
-        history.removeAll(oldKeys);
-        if (!replacement.isEmpty()) history.putAll(replacement);
+        states.removeAll(oldKeys);
+        if (!replacement.isEmpty()) states.putAll(replacement);
     }
 
-    private BinaryObject historyKey(long elevatorId, int slot) {
-        return client.binary().builder(Schema.HISTORY_KEY_TYPE)
-                .setField("ELEVATOR_ID", elevatorId, Long.class)
+    private BinaryObject stateKey(long elevatorId, int slot) {
+        return client.binary().builder(Schema.KEY_TYPE)
+                .setField("EId", elevatorId, Long.class)
                 .setField("SLOT", slot, Integer.class).build();
     }
 
@@ -185,28 +186,35 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
 
     /** 存储结构定义与启动校验：SQL 用于建表和查询，事务写入统一使用 Cache API。 */
     static final class Schema {
-        static final String LATEST = "HB_LATEST", HISTORY = "HB_HISTORY", REGION = "heartbeat";
-        static final String VALUE_TYPE = "HeartbeatStateV1", HISTORY_KEY_TYPE = "HeartbeatHistoryKeyV1";
+        static final String CACHE = "HB_STATE", REGION = "heartbeat";
+        static final int LATEST_SLOT = -1;
+        static final String VALUE_TYPE = "HeartbeatStateRowV1", KEY_TYPE = "HeartbeatStateKeyV1";
         static final Map<String, Field> STATE_FIELDS;
         static final Map<String, Class<?>> VALUE_FIELDS;
 
         static {
             Map<String, Field> stateFields = new LinkedHashMap<>();
-            // 显式列出持久化字段，新增解析字段时须同步核对映射和建表脚本。
-            String names = "intId fId code floor acd direction rs doorLock isActive isDebug isRepair isPower "
-                    + "isDoor isHardware isCall runTotal runTime speed mainFaultCode subFaultCode doorCounter "
-                    + "secDoorCouter weight tcda tcdb tcdc tcdStopOutsideDoor tcdOpenDoorRuning tcdEntrapment "
-                    + "tcdDoor sendCount receiveCount signalRssi networkType recordStatus status createdDate updatedDate";
+            // 左侧严格使用《心跳数据摸底情况》拆分后字段名；右侧保留解析模型的Java字段名。
+            String names = "IntId:intId FId:fId Code:code Floor:floor ACD:acd Direction:direction RS:rs "
+                    + "DoorLock:doorLock IsActive:isActive IsDebug:isDebug IsRepair:isRepair IsPower:isPower "
+                    + "IsDoor:isDoor IsHardware:isHardware IsCall:isCall RunTotal:runTotal RunTime:runTime "
+                    + "Speed:speed MainFaultCode:mainFaultCode SubFaultCode:subFaultCode DoorCounter:doorCounter "
+                    + "SecDoorCouter:secDoorCouter Weight:weight TCDA:tcda TCDB:tcdb TCDC:tcdc "
+                    + "TCDStopOutsideDoor:tcdStopOutsideDoor TCDOpenDoorRuning:tcdOpenDoorRuning "
+                    + "TCDEntrapment:tcdEntrapment TCDDoor:tcdDoor SendCount:sendCount ReceiveCount:receiveCount "
+                    + "SignalRssi:signalRssi NetworkType:networkType RecordStatus:recordStatus Status:status "
+                    + "CreatedDate:createdDate UpdatedDate:updatedDate";
             try {
                 for (String name : names.split(" ")) {
-                    String column = "STATE_" + name.replaceAll("([a-z0-9])([A-Z])", "$1_$2").toUpperCase(Locale.ROOT);
-                    stateFields.put(column, ElevatorState.class.getField(name));
+                    String[] mapping = name.split(":");
+                    stateFields.put(mapping[0], ElevatorState.class.getField(mapping[1]));
                 }
             } catch (NoSuchFieldException e) { throw new ExceptionInInitializerError(e); }
             STATE_FIELDS = Collections.unmodifiableMap(stateFields);
             Map<String, Class<?>> valueFields = new LinkedHashMap<>();
             valueFields.put("PORT", Integer.class);
-            valueFields.put("SEND_TIME_MS", Long.class);
+            valueFields.put("SendTime", Long.class);
+            valueFields.put("part_day", String.class);
             valueFields.put("SEND_TIME_RAW", String.class);
             valueFields.put("CREATED_TIME_MS", Long.class);
             valueFields.put("FLINK_SEQUENCE", Long.class);
@@ -226,14 +234,13 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
 
         static void validate(IgniteClient client) {
             Set<String> caches = new HashSet<>(client.cacheNames());
-            for (String name : Arrays.asList(LATEST, HISTORY)) {
-                if (!caches.contains(name)) throw new IllegalStateException("缺少缓存" + name + "，请先执行sql/ignite2-heartbeat.sql");
-                validate(client.cache(name).getConfiguration(), name);
-            }
+            if (!caches.contains(CACHE)) throw new IllegalStateException("缺少缓存" + CACHE + "，请先执行sql/ignite2-heartbeat.sql");
+            validate(client.cache(CACHE).getConfiguration());
         }
 
-        static void validate(ClientCacheConfiguration config, String name) {
-            boolean history = HISTORY.equals(name);
+        static void validate(ClientCacheConfiguration config) {
+            String name = CACHE;
+            require(CACHE.equals(config.getName()), name, "缓存名");
             require(config.getAtomicityMode() == CacheAtomicityMode.TRANSACTIONAL, name, "ATOMICITY=TRANSACTIONAL");
             require(config.getCacheMode() == CacheMode.PARTITIONED, name, "PARTITIONED");
             require(config.getWriteSynchronizationMode() == CacheWriteSynchronizationMode.FULL_SYNC, name, "FULL_SYNC");
@@ -246,18 +253,16 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             QueryEntity entity = entities[0];
             require(name.equals(entity.getTableName()), name, "表名");
             require(VALUE_TYPE.equals(entity.getValueType()), name, "VALUE_TYPE=" + VALUE_TYPE);
-            require((history ? HISTORY_KEY_TYPE : Long.class.getName()).equals(entity.getKeyType()), name, "KEY_TYPE");
+            require(KEY_TYPE.equals(entity.getKeyType()), name, "KEY_TYPE=" + KEY_TYPE);
             Map<String, String> expected = new LinkedHashMap<>();
-            expected.put("ELEVATOR_ID", Long.class.getName());
-            if (history) expected.put("SLOT", Integer.class.getName());
+            expected.put("EId", Long.class.getName());
+            expected.put("SLOT", Integer.class.getName());
             VALUE_FIELDS.forEach((column, type) -> expected.put(column, type.getName()));
-            require(expected.equals(entity.getFields()), name, "字段名称及类型，须与CreatedDate建表脚本完全一致");
+            require(expected.equals(entity.getFields()), name, "字段名称、大小写及类型，须与HB_STATE建表脚本完全一致");
             if (entity.getNotNullFields() != null) {
                 require(Collections.disjoint(entity.getNotNullFields(), STATE_FIELDS.keySet()), name, "业务字段必须允许NULL");
             }
-            if (history) {
-                require(new HashSet<>(Arrays.asList("ELEVATOR_ID", "SLOT")).equals(entity.getKeyFields()), name, "历史表复合主键");
-            } else require("ELEVATOR_ID".equals(entity.getKeyFieldName()), name, "最新表主键");
+            require(new HashSet<>(Arrays.asList("EId", "SLOT")).equals(entity.getKeyFields()), name, "复合主键(EId,SLOT)");
             if (entity.getAliases() != null) entity.getAliases().forEach((field, alias) ->
                     require(Objects.equals(field, alias), name, "禁止修改字段别名"));
         }
@@ -281,7 +286,9 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             createdTimeMs = update.createdTimeMs;
             Map<String, Object> fields = new LinkedHashMap<>();
             fields.put("PORT", update.port);
-            fields.put("SEND_TIME_MS", update.sendTimeMs);
+            fields.put("SendTime", update.sendTimeMs);
+            fields.put("part_day", Instant.ofEpochMilli(createdTimeMs)
+                    .atZone(ZoneId.of("Asia/Shanghai")).toLocalDate().toString());
             fields.put("SEND_TIME_RAW", update.sendTimeRaw);
             fields.put("CREATED_TIME_MS", update.createdTimeMs);
             fields.put("FLINK_SEQUENCE", update.historySequence);
