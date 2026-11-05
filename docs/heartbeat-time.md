@@ -29,7 +29,7 @@
 
 数据库使用 [建表脚本](../sql/ignite2-heartbeat.sql) 中的单表 `PUBLIC.HB_STATE`，每梯SLOT=-1保存最新状态，SLOT>=0保存默认最多10条历史；保留条数支持热更新，调小后在该梯下一条新心跳被接受时事务内清理，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。`CREATED_TIME_MS` 是比较依据，`createddate` 保留日期文本，`part_day` 是按北京时间生成的yyyy-MM-dd日期。`sendtime` 和 `SEND_TIME_RAW` 仅用于追踪。数据库独立维护DB_SEQUENCE，不使用Flink序号决定历史槽位。
 
-首次部署执行当前建表脚本，按 [YARN Application部署说明](heartbeat-ignite.md#yarn-application正式运行) 提交，不携带旧项目保存点。应用不自动建表或修改既有表结构；同名表结构不匹配时预检会明确报错。
+首次部署按 [内存模式部署说明](ignite-memory.md) 准备服务端区域并提交，不携带旧项目保存点。正式作业自动创建缺失空表，也可手工执行建表脚本；应用不修改既有表结构，同名表结构或区域不匹配时明确报错。
 
 ```sql
 SELECT eid, createddate, CREATED_TIME_MS, part_day,

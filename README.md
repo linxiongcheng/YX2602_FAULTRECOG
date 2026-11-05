@@ -2,11 +2,11 @@
 
 Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式校验、分梯、字段规范化、10分钟过期过滤及按电梯判断新旧，输出带历史序号的单梯状态。读取和解析异常都可靠写入配置的异常Topic。解析规则与字段映射详见 [解析模块说明](docs/heartbeat-parser.md)。正式写入与部署详见 [Ignite 模块说明](docs/heartbeat-ignite.md)。
 
-正式上线从 [部署执行顺序](docs/heartbeat-ignite.md#正式部署顺序) 开始，包含已有Ignite服务接入、Java 11的YARN容器参数、动态配置同步、提交与验收、Checkpoint/Savepoint目录及停止恢复命令，以及AM启动失败排查。
+当前采用 **Ignite纯内存心跳窗口**：服务端配置独立 `heartbeat_memory` 区域且 `persistenceEnabled=false`，全停后丢失的窗口由新心跳重新建立，不回放Kafka历史。正式作业自动创建不存在的空表，既有旧表不会自动迁移或删除。首次切换及后续内存服务重启按 [内存模式部署说明](docs/ignite-memory.md) 执行。
 
 旧表改为查询无需引号的结构，按 [清空重建与重新部署](docs/redeploy-unquoted-columns.md) 执行。
 
-查找服务器数据位置：见 [Ignite实际持久化目录](docs/heartbeat-ignite.md#ignite实际持久化目录)。已核对 `AI-slave06` 的宿主机数据目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，对应容器 `/opt/ignite/work/db`，位于挂载到 `/home` 的 `/dev/sdb1`（XFS）。文档包含心跳表完整目录、核查依据及查看命令。
+旧持久化方案的服务器目录记录：见 [Ignite实际持久化目录](docs/heartbeat-ignite.md#ignite实际持久化目录)。已核对 `AI-slave06` 的宿主机数据目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，对应容器 `/opt/ignite/work/db`，位于挂载到 `/home` 的 `/dev/sdb1`（XFS）。该记录保留供查阅，不代表新版内存窗口仍会落盘或从旧文件恢复。
 
 保留消费积压并将并行度从2调整为3：按 [保留积压调整并行度](docs/heartbeat-ignite.md#保留积压调整并行度) 先停止并生成Savepoint，再用启动脚本的 `--from-savepoint` 参数恢复；无需重新打包JAR。
 
@@ -46,7 +46,7 @@ Kafka 原始心跳（bytes，保留来源坐标）
 
 **业务时间只取CreatedDate，时区固定为北京时间（Asia/Shanghai）。** 例如 `2026/1/22 17:56:17` 对应UTC `2026-01-22T09:56:17Z`，不受JVM默认时区影响。缺失、空值或非法日期写异常Topic，不回退到SendTime、Kafka时间或接收时间。同梯CreatedDate相同仍按重复过滤；上游只提供秒精度时，同一秒最多接受一条。平台时钟用于超前与过期判断，需要节点时钟同步。
 
-按新项目首次部署：执行当前建表脚本创建 `PUBLIC.HB_STATE`，不迁移旧数据、不加载旧项目的Checkpoint/Savepoint。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
+按新项目首次部署：管理员配置内存区域并处理旧同名表，正式启动自动创建空 `PUBLIC.HB_STATE`，也可手工执行当前建表脚本。不迁移旧数据、不加载旧项目的Checkpoint/Savepoint。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
 
 存储使用一张 `HB_STATE` 表：主键为 `(EID, SLOT)`，`SLOT=-1` 是最新状态，`SLOT>=0` 是最近N条历史，每梯最多N+1行。业务列沿用心跳文档中拆分后的41个字段拼写，建表不加字段双引号，Ignite统一保存为大写；查询直接写 `eid`、`floor`、`mainfaultcode`、`createddate` 即可。`part_day` 按CreatedDate的北京时间日期生成。查历史须过滤掉SLOT=-1。完整查询示例见 [存储说明](docs/heartbeat-ignite.md#检查点重试与运维)。
 
@@ -74,7 +74,7 @@ src/main/java/com/hitachi/yx2602/heartbeat/
   ElevatorState.java            可空业务字段
   ElevatorUpdate.java           单梯状态、时间、序号和来源信息
   CreatedVersion.java           Flink保存的每梯业务时间和历史序号
-sql/ignite2-heartbeat.sql        手工建表脚本
+sql/ignite2-heartbeat.sql        内存表DDL，打入JAR供缺表时执行，也可手工建表
 config/reader.example.properties
 bin/watch-history-config.sh     提交节点配置同步入口；共享策略文件由程序自动生成
 bin/start-heartbeat.sh          使用固定集群路径提交YARN Application正式任务
@@ -155,7 +155,7 @@ KafkaSource 不自动提交；正常消费位点只随成功检查点提交。�
 
 Flink内部检查点模式为EXACTLY_ONCE，但异常Topic对外承诺仍为**至少一次**；生产者幂等不能消除任务重放导致的重复。异常消息的 `message_id=topic:partition:offset` 可用于同一源集群/Topic生命周期内去重。Topic删除重建后offset可能复用，归档需同时区分集群和Topic生命周期。
 
-已保存位点超出Kafka保留范围时任务报错，不静默跳到最新。Kafka保留时间必须覆盖预期停机和恢复时间。完整端到端可靠性还依赖后续正常分支的持久化Sink参与同一检查点；仅返回DataStream本身不等于业务已落地。
+已保存位点超出Kafka保留范围时任务报错，不静默跳到最新。不需要旧消息时，应使用新组直接启动。当前Ignite内存窗口允许全停后丢失；Flink检查点完成仅说明当时写入已确认，不保证Ignite重启后仍保存这些数据。
 
 ## 连接读取解析与后续更新模块
 

@@ -10,7 +10,6 @@ import org.apache.ignite.configuration.ClientConnectorConfiguration;
 import org.apache.ignite.configuration.DataRegionConfiguration;
 import org.apache.ignite.configuration.DataStorageConfiguration;
 import org.apache.ignite.configuration.IgniteConfiguration;
-import org.apache.ignite.configuration.WALMode;
 import org.apache.ignite.logger.NullLogger;
 import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
 import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;
@@ -34,7 +33,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Real Ignite 2.18.0 server, SQL provisioning, thin clients and durable storage. */
+/** Real Ignite 2.18.0 in-memory server, cold table creation and transactional thin clients. */
 @Timeout(90)
 class IgniteStoreTest {
     @TempDir static Path directory;
@@ -46,17 +45,12 @@ class IgniteStoreTest {
         properties.setProperty("ignite.addresses", "127.0.0.1:10990");
         settings = ReaderConfig.from(properties, key -> null).ignite;
         startServer();
-        String sql = new String(Files.readAllBytes(java.nio.file.Paths.get("sql/ignite2-heartbeat.sql")),
-                java.nio.charset.StandardCharsets.UTF_8);
-        sql = sql.replaceAll("(?m)^--.*$", "");
-        for (String statement : sql.split(";")) {
-            if (!statement.trim().isEmpty()) query(statement);
-        }
+        try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings)) { }
     }
 
     private static void startServer() {
         DataRegionConfiguration region = new DataRegionConfiguration().setName(IgniteHeartbeatStore.Schema.REGION)
-                .setPersistenceEnabled(true).setInitialSize(32L << 20).setMaxSize(128L << 20);
+                .setPersistenceEnabled(false).setInitialSize(32L << 20).setMaxSize(128L << 20);
         IgniteConfiguration cfg = new IgniteConfiguration()
                 .setIgniteInstanceName("heartbeat-integration-test").setConsistentId("heartbeat-test-node")
                 .setLocalHost("127.0.0.1").setWorkDirectory(directory.resolve("work").toString())
@@ -69,11 +63,7 @@ class IgniteStoreTest {
                 .setCommunicationSpi(new TcpCommunicationSpi().setLocalPort(47190).setSelectorsCount(1))
                 .setDiscoverySpi(new TcpDiscoverySpi().setLocalPort(47590).setIpFinder(
                         new TcpDiscoveryVmIpFinder().setAddresses(Collections.singletonList("127.0.0.1:47590"))))
-                .setDataStorageConfiguration(new DataStorageConfiguration().setDefaultDataRegionConfiguration(region)
-                        .setStoragePath(directory.resolve("db").toString())
-                        .setWalPath(directory.resolve("wal").toString())
-                        .setWalArchivePath(directory.resolve("wal-archive").toString())
-                        .setWalSegmentSize(8 << 20).setWalMode(WALMode.FSYNC));
+                .setDataStorageConfiguration(new DataStorageConfiguration().setDefaultDataRegionConfiguration(region));
         server = Ignition.start(cfg);
         server.cluster().state(ClusterState.ACTIVE);
     }
@@ -152,7 +142,7 @@ class IgniteStoreTest {
                 + elevatorId + " AND DB_SEQUENCE=" + to));
     }
 
-    /** Count calls at the actual thin-client boundary while still using the real persistent server. */
+    /** Count calls at the actual thin-client boundary while still using the real server. */
     private static final class CacheProbe {
         final java.util.Map<String, Integer> calls = new java.util.LinkedHashMap<>();
         final List<Long> latestReads = new ArrayList<>();
@@ -496,17 +486,43 @@ class IgniteStoreTest {
         }
     }
 
-    @Test void durableRestartKeepsLatestAndHistorySlotsAndExistingClientCanReconnect() throws Exception {
+    @Test void memoryRestartLosesWindowAndNewHeartbeatsRebuildItWithExistingClient() throws Exception {
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
             store.write(rows(update(99, 1, 1)));
+            store.write(rows(update(100, 1, 1)));
             server.close();
             startServer();
-            assertEquals(1L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
-            assertEquals(1L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=99").get(0).get(0));
-            assertEquals(0, store.write(rows(update(99, 1, 1))));
+            assertFalse(server.cacheNames().contains(IgniteHeartbeatStore.Schema.CACHE));
             assertEquals(1, store.write(rows(update(99, 2, 2))));
-            assertEquals(2L, query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
+            assertEquals(1L, query("SELECT DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
+            assertEquals(0L, query("SELECT COUNT(*) FROM HB_STATE WHERE eid=100").get(0).get(0));
+            for (int n = 3; n <= 15; n++) store.write(rows(update(99, n, n)));
+            assertEquals(11L, query("SELECT COUNT(*) FROM HB_STATE WHERE eid=99").get(0).get(0));
+            assertEquals(6L, query("SELECT MIN(CREATED_TIME_MS) FROM HB_STATE WHERE SLOT>=0 AND eid=99").get(0).get(0));
+            assertEquals(15L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
         }
+    }
+
+    @Test void readOnlyCheckDoesNotCreateMissingTableAndConcurrentWritersCanCreateIt() throws Exception {
+        server.destroyCache(IgniteHeartbeatStore.Schema.CACHE);
+        assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings, false));
+        assertFalse(server.cacheNames().contains(IgniteHeartbeatStore.Schema.CACHE));
+        CyclicBarrier barrier = new CyclicBarrier(3);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int n = 1; n <= 3; n++) {
+            final int id = n;
+            futures.add(CompletableFuture.runAsync(() -> {
+                try {
+                    barrier.await(10, TimeUnit.SECONDS);
+                    try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+                        store.write(rows(update(id, 1, 1)));
+                    }
+                } catch (Exception error) { throw new RuntimeException(error); }
+            }));
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
+        assertEquals(3L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT=-1").get(0).get(0));
+        try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings, false)) { }
     }
 
     @Test void startupRejectsAtomicCacheAndMissingFields() {
@@ -518,8 +534,15 @@ class IgniteStoreTest {
         config.setAtomicityMode(CacheAtomicityMode.ATOMIC);
         assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
         config.setAtomicityMode(CacheAtomicityMode.TRANSACTIONAL);
+        config.setDataRegionName("heartbeat");
+        assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
+        config.setDataRegionName(IgniteHeartbeatStore.Schema.REGION);
         config.getQueryEntities()[0].getFields().remove("SPEED");
         assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
+    }
+
+    static void removeTableForPackagedColdStart() {
+        server.destroyCache(IgniteHeartbeatStore.Schema.CACHE);
     }
 
     @Test void realFlinkSinkFlushesShortFinalBatch() throws Exception {

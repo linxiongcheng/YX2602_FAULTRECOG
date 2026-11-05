@@ -2,6 +2,8 @@
 
 本模块将解析层接受的单梯状态写入 Ignite。Java 编译和运行版本统一为11，Flink保持1.20.5，Ignite客户端和服务端均为2.18.0。业务时间统一使用CreatedDate（北京时间），读取、解析算子UID保持不变。时间规则见 [CreatedDate说明](heartbeat-time.md)。
 
+当前部署使用独立 `heartbeat_memory` 区域，服务端须设置 `persistenceEnabled=false`。全停后允许丢失窗口，随新心跳重建，不做历史回放。**本次切换与全停后的启动以 [内存模式](ignite-memory.md) 为准**；下文保存点命令用于需要保留Flink处理进度的维护，不用于恢复丢失的Ignite数据。历史性能测试与磁盘目录记录标注的是旧持久化方案。
+
 旧表升级到无需引号的字段结构，请按 [清空重建与重新部署](redeploy-unquoted-columns.md) 操作。必须同时更新建表脚本和JAR，不能只改SQL文件。
 
 ## 正式部署顺序
@@ -14,13 +16,13 @@
 4. [初始化并启动历史配置同步](#历史条数热更新)，成功生成共享文件后执行配置与数据库预检。
 5. [提交YARN Application](#yarn-application正式运行)，正式模式使用 `--run`。
 6. [检查作业和入库结果](#运行验收与日志)，确认RUNNING、检查点成功、业务数据持续更新。
-7. 后续维护按 [Checkpoint与Savepoint](#checkpoint与savepoint) 保存并恢复状态，启动失败按 [常见部署问题](#常见部署问题) 提取日志。
+7. 内存服务全停后按 [内存模式](ignite-memory.md) 直接启动新窗口；仅需要保留Flink处理进度的维护可参考 [Checkpoint与Savepoint](#checkpoint与savepoint)。
 
 ## 写入契约
 
 所有状态存入一张 `PUBLIC.HB_STATE`，复合主键为 `(EID, SLOT)`。每台电梯的 `SLOT=-1` 固定保存最新状态，非负槽位保存最近N条历史；N默认10，可在1～1000之间配置并在运行中调整。历史包含当前最新状态，因此每梯最多N+1行；累计不足N条时不填充空行。保留的是成功接受的最近N次状态，不是最近10分钟的全部数据。调小上限后，各电梯在下一条新心跳被接受时清理；离线电梯暂时维持原有历史。
 
-事务使用 Ignite Java thin client 的缓存 API，模式为 `PESSIMISTIC + REPEATABLE_READ`。SQL用于手工建表与查询。每批事务按电梯ID排序获取锁，同一电梯的输入顺序保持不变：
+事务使用 Ignite Java thin client 的缓存 API，模式为 `PESSIMISTIC + REPEATABLE_READ`。SQL用于缺表时自动建表（也可手工执行）与查询。每批事务按电梯ID排序获取锁，同一电梯的输入顺序保持不变：
 
 1. 事务内按电梯ID顺序读取并锁定该梯 `SLOT=-1` 的最新状态，包括尚不存在的复合主键；每批每梯只读取一次，两个并发首次写入也按这个固定键串行处理。
 2. `createdTimeMs <= 数据库最新CREATED_TIME_MS` 时忽略，不递增序号，不写历史。
@@ -49,6 +51,8 @@
 
 ### 更新与效果对比
 
+本节用于同一存储模式下的性能版本更新。旧持久化区域首次切换到内存区域时，请使用 [内存模式部署说明](ignite-memory.md)，其中需要处理旧同名表，不能直接套用本节的保存点升级步骤。
+
 这次优化需要更新JAR；表结构、配置键、算子UID和Flink状态结构沿用当前单表版本，可以从本单表作业Savepoint恢复。操作顺序：
 
 1. 先记录当前消费组、并行度、两个相隔60秒的入库指标、队列、Checkpoint耗时及各分区LAG；确认比较的单位为单梯心跳，Kafka消息可能拆成多梯。
@@ -70,7 +74,7 @@ bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
 
 ## 表与字段
 
-手工执行 [建表脚本](../sql/ignite2-heartbeat.sql)，新建 `PUBLIC.HB_STATE`。本次按新项目部署，不迁移旧表数据、不加载旧项目的Checkpoint/Savepoint。新程序只访问HB_STATE，原有两张表不会被自动读取、修改或删除。已有同名HB_STATE表导致脚本报错时，先核对结构。
+正式作业在表不存在时执行JAR内的 [建表脚本](../sql/ignite2-heartbeat.sql)，新建空 `PUBLIC.HB_STATE`；也可由管理员手工执行。本次按新项目部署，不迁移旧表数据、不加载旧项目的Checkpoint/Savepoint。已有同名表会严格校验，不自动删除、修改或迁移；IF NOT EXISTS不会改变旧表所在区域。
 
 业务列沿用《心跳数据摸底情况.docx》中“拆分后实际字段”的41项拼写，不添加STATE前缀，也不保留端口数字后缀。建表时字段标识符不加双引号，Ignite统一保存为大写；查询可直接写 `eid`、`floor`、`mainfaultcode`，也可以使用混合大小写。Java解析模型、原始Kafka字段和预览JSON继续使用原有名称。
 
@@ -97,9 +101,9 @@ bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
 
 业务字段使用 `BIGINT` 或 `VARCHAR`，缺失值保持NULL；不补零、不继承旧值。字段与类型的完整清单以SQL脚本为准，`SecDoorCouter`、`TCDOpenDoorRuning` 等名称保留文档既有拼写。文档示例中的空字符串SendTime会保存为NULL，其原始JSON表示保留在SEND_TIME_RAW中，CreatedDate仍然决定新旧、过期和part_day。
 
-缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV2`。启动检查缓存存在性、事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型。程序只访问已有缓存。
+缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat_memory` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV2`。启动检查事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型。正式连接可建缺失空表，只读预检不建表。
 
-客户端无法仅凭缓存配置证明服务端已开启持久化。`--check-ignite` 的成功只证明连接、ACTIVE状态和上述结构符合要求；服务端持久化和WAL设置由现有服务管理员核实。
+客户端无法仅凭缓存配置证明服务端已关闭持久化。`--check-ignite` 的成功只证明连接、ACTIVE状态和上述结构符合要求；服务管理员须确认 `heartbeat_memory.persistenceEnabled=false`。
 
 ### 新增辅助字段说明
 
@@ -207,11 +211,11 @@ mvn -B -ntp clean verify
 
 - 客户端地址、端口（常用10800）、账号密码及TLS要求，确保提交节点和YARN容器能访问。
 - 服务处于ACTIVE状态，支持SQL建表及事务缓存，并提供业务表所需的读写权限。
-- 业务数据所在区域的持久化、WAL和副本策略，以及是否符合项目对数据恢复的要求。
+- 独立 `heartbeat_memory` 区域的 `persistenceEnabled=false`、内存容量及禁用淘汰设置；本项目不要求全停后的数据恢复。
 
-当前建表脚本指定 `DATA_REGION=heartbeat`、`BACKUPS=0`，代码也校验数据区域名为 `heartbeat`。这些仍是当前实现的要求，需要管理员确认是否适合现有服务；若数据区域或副本策略不同，应先适配脚本和相关校验，不能假定现有服务符合要求。
+当前建表脚本指定 `DATA_REGION=heartbeat_memory`、`BACKUPS=0`，代码也校验区域名。配置片段、旧表切换和权限要求见 [内存模式部署说明](ignite-memory.md)。
 
-指定 `DATA_REGION=heartbeat` 不会自动启用持久化。请管理员确认该区域实际的 `persistenceEnabled` 设置，以及重启前后的存储目录、磁盘挂载和节点标识。`BACKUPS=0` 表示没有备份副本，不能提供节点故障切换保障。Flink检查点不会备份Ignite表中的业务数据。
+区域名称本身不控制持久化，必须确认服务端实际开关。`BACKUPS=0` 表示没有备份副本，多节点服务中单节点丢失也可能丢失分区。Flink检查点不会备份Ignite表中的业务数据。
 
 有建表权限时，使用已安装的SQLLine客户端或管理员提供的SQL工具连接现有服务。以下仅为客户端连接示例，按实际安装路径和服务地址调整：
 
@@ -487,6 +491,8 @@ yarn logs -applicationId "$FLINK_APP_ID" \
 正式模式的正常心跳写入Ignite，不会像 `--preview` 一样逐条打印JSON。收到Application ID仅表示提交已受理。启动错误优先看JobManager/AM的 `stderr`、`jobmanager.log` 和 `prelaunch.err`，后续处理错误还需查看TaskManager日志。未启用日志聚合或日志尚未聚合时，从YARN页面进入对应Attempt和容器的Logs。
 
 ## Ignite实际持久化目录
+
+本节是旧持久化方案的现场记录，保留供运维查阅。当前内存窗口不从这些旧文件恢复，不要据此删除共享服务的数据目录。
 
 2026-11-04 根据服务器 `AI-slave06` 的现场命令截图核对：该节点的Ignite运行在Docker容器环境中，`HB_STATE` 分区数据文件位于容器的 `/opt/ignite/work/db`；对应宿主机目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，底层磁盘为挂载在 `/home` 的 `/dev/sdb1`（XFS）。以下记录只对应本次核查节点，不代表其他Ignite节点使用相同目录。
 

@@ -4,6 +4,8 @@
 
 ## 开启与升级
 
+切换到纯内存窗口时，以 [内存模式部署说明](ignite-memory.md) 的新组、无Savepoint启动流程为准。下面的保存点升级流程适用于仅更新监控、需要保留Flink处理进度的场景。
+
 更新本次生成的 `target/heartbeat-reader-0.1.0.jar`。现有JAR没有这些埋点，只改日志级别不能得到这些统计。按 [更新与效果对比](heartbeat-ignite.md#更新与效果对比) 先停止并生成Savepoint，再替换JAR并从保存点恢复，保持原消费组和其他性能参数，便于比较。
 
 可在服务器 `/home/xiong/projects/YX2602_FAULTRECOG/config/local.properties` 添加：

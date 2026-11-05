@@ -95,6 +95,12 @@
     </snapshotRepository>
   </distributionManagement>
   <build>
+    <resources>
+      <resource><directory>src/main/resources</directory></resource>
+      <resource><directory>sql</directory><targetPath>sql</targetPath>
+        <includes><include>ignite2-heartbeat.sql</include></includes>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId><artifactId>maven-jar-plugin</artifactId><version>3.4.1</version>

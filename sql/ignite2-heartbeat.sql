@@ -1,12 +1,13 @@
--- Apache Ignite 2.18.0: execute manually in the existing service for a fresh deployment.
+-- Apache Ignite 2.18.0: empty in-memory heartbeat table; also packaged for automatic RUN startup.
 -- SLOT=-1 is the latest state/transaction lock; SLOT>=0 holds up to N history records.
 -- Business columns follow the document spelling and use unquoted SQL identifiers.
 -- Ignite normalizes identifiers to uppercase; queries can use eid, EId or EID without quotes.
 -- CreatedDate is the only business clock. WITH option quotes are Ignite DDL syntax, not column quotes.
--- DATA_REGION=heartbeat must exist; persistence and backup policy are managed by the service owner.
--- No automatic creation, DROP or migration. Do not modify latest/history slots independently.
+-- The service owner must configure heartbeat_memory with persistenceEnabled=false and no eviction.
+-- RUN creates the table only if absent. No automatic DROP or migration of existing tables.
+-- A full in-memory cluster restart loses the window; new heartbeats rebuild it without historical replay.
 
-CREATE TABLE PUBLIC.HB_STATE (
+CREATE TABLE IF NOT EXISTS PUBLIC.HB_STATE (
     EID BIGINT NOT NULL,
     SLOT INT NOT NULL,
     INTID BIGINT,
@@ -64,4 +65,4 @@ CREATE TABLE PUBLIC.HB_STATE (
     HISTORY_POLICY_VERSION BIGINT,
     STORED_AT_MS BIGINT,
     PRIMARY KEY (EID, SLOT)
-) WITH "CACHE_NAME=HB_STATE,TEMPLATE=partitioned,ATOMICITY=TRANSACTIONAL,BACKUPS=0,WRITE_SYNCHRONIZATION_MODE=FULL_SYNC,DATA_REGION=heartbeat,VALUE_TYPE=HeartbeatStateRowV2,KEY_TYPE=HeartbeatStateKeyV2,AFFINITY_KEY=EID";
+) WITH "CACHE_NAME=HB_STATE,TEMPLATE=partitioned,ATOMICITY=TRANSACTIONAL,BACKUPS=0,WRITE_SYNCHRONIZATION_MODE=FULL_SYNC,DATA_REGION=heartbeat_memory,VALUE_TYPE=HeartbeatStateRowV2,KEY_TYPE=HeartbeatStateKeyV2,AFFINITY_KEY=EID";

@@ -7,6 +7,7 @@ import org.apache.ignite.cache.CacheAtomicityMode;
 import org.apache.ignite.cache.CacheMode;
 import org.apache.ignite.cache.CacheWriteSynchronizationMode;
 import org.apache.ignite.cache.QueryEntity;
+import org.apache.ignite.cache.query.SqlFieldsQuery;
 import org.apache.ignite.client.ClientCache;
 import org.apache.ignite.client.ClientCacheConfiguration;
 import org.apache.ignite.client.ClientException;
@@ -37,6 +38,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     private final IgniteConfig config;
     private final IgniteConfig.HistorySettings historySettings;
     private final HeartbeatDiagnostics diagnostics;
+    private final boolean createIfMissing;
     private IgniteClient client;
     private ClientCache<BinaryObject, BinaryObject> states;
 
@@ -45,8 +47,17 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     }
 
     IgniteHeartbeatStore(IgniteConfig config, HeartbeatDiagnostics diagnostics) {
+        this(config, diagnostics, true);
+    }
+
+    IgniteHeartbeatStore(IgniteConfig config, boolean createIfMissing) {
+        this(config, HeartbeatDiagnostics.disabled(), createIfMissing);
+    }
+
+    private IgniteHeartbeatStore(IgniteConfig config, HeartbeatDiagnostics diagnostics, boolean createIfMissing) {
         this.config = config;
         this.diagnostics = diagnostics;
+        this.createIfMissing = createIfMissing;
         config.requireAddresses();
         historySettings = new IgniteConfig.HistorySettings(config);
         try { connect(); }
@@ -72,7 +83,8 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             if (client.cluster().state() != org.apache.ignite.cluster.ClusterState.ACTIVE) {
                 throw new IllegalStateException("Ignite集群必须处于ACTIVE可写状态");
             }
-            Schema.validate(client);
+            if (createIfMissing) Schema.ensure(client);
+            else Schema.validate(client);
             states = client.<BinaryObject, BinaryObject>cache(Schema.CACHE).withKeepBinary();
         } catch (RuntimeException e) { disconnect(); throw e; }
     }
@@ -238,7 +250,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
 
     /** 存储结构定义与启动校验：SQL 用于建表和查询，事务写入统一使用 Cache API。 */
     static final class Schema {
-        static final String CACHE = "HB_STATE", REGION = "heartbeat";
+        static final String CACHE = "HB_STATE", REGION = "heartbeat_memory";
         static final int LATEST_SLOT = -1;
         static final String VALUE_TYPE = "HeartbeatStateRowV2", KEY_TYPE = "HeartbeatStateKeyV2";
         static final Map<String, Field> STATE_FIELDS;
@@ -284,6 +296,26 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             VALUE_FIELDS = Collections.unmodifiableMap(valueFields);
         }
 
+        /** Cold starts create an empty table only; existing tables are never dropped or altered. */
+        static void ensure(IgniteClient client) {
+            if (!client.cacheNames().contains(CACHE)) {
+                String ddl;
+                try (java.io.InputStream input = Schema.class.getResourceAsStream("/sql/ignite2-heartbeat.sql")) {
+                    if (input == null) throw new IllegalStateException("JAR缺少sql/ignite2-heartbeat.sql");
+                    ddl = new String(input.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)
+                            .replaceAll("(?m)^--.*$", "").trim();
+                } catch (java.io.IOException error) {
+                    throw new IllegalStateException("无法读取内存表建表脚本", error);
+                }
+                // IF NOT EXISTS handles simultaneous starts of multiple Sink clients.
+                try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor =
+                             client.query(new SqlFieldsQuery(ddl).setSchema("PUBLIC"))) {
+                    cursor.getAll();
+                }
+            }
+            validate(client);
+        }
+
         static void validate(IgniteClient client) {
             Set<String> caches = new HashSet<>(client.cacheNames());
             if (!caches.contains(CACHE)) throw new IllegalStateException("缺少缓存" + CACHE + "，请先执行sql/ignite2-heartbeat.sql");
@@ -296,7 +328,9 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             require(config.getAtomicityMode() == CacheAtomicityMode.TRANSACTIONAL, name, "ATOMICITY=TRANSACTIONAL");
             require(config.getCacheMode() == CacheMode.PARTITIONED, name, "PARTITIONED");
             require(config.getWriteSynchronizationMode() == CacheWriteSynchronizationMode.FULL_SYNC, name, "FULL_SYNC");
-            require(REGION.equals(config.getDataRegionName()), name, "DATA_REGION=heartbeat");
+            require(REGION.equals(config.getDataRegionName()), name,
+                    "DATA_REGION=" + REGION + "，实际=" + config.getDataRegionName()
+                            + "；旧表须由管理员按docs/ignite-memory.md切换");
             require("PUBLIC".equals(config.getSqlSchema()) || "\"PUBLIC\"".equals(config.getSqlSchema()), name,
                     "SQL_SCHEMA=PUBLIC，实际=" + config.getSqlSchema());
             require(config.getExpiryPolicy() == null, name, "禁止配置过期策略");

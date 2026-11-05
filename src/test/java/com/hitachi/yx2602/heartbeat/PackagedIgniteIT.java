@@ -68,6 +68,7 @@ class PackagedIgniteIT {
         IgniteStoreTest.directory = directory;
         try {
             IgniteStoreTest.provision();
+            IgniteStoreTest.removeTableForPackagedColdStart();
             String java = Paths.get(System.getProperty("java.home"), "bin", "java").toString();
             String classpath = Paths.get("target/heartbeat-reader-0.1.0.jar").toAbsolutePath()
                     + File.pathSeparator + Paths.get("target/test-classes").toAbsolutePath();
