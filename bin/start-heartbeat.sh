@@ -2,8 +2,11 @@
 set -eo pipefail
 
 # Fixed paths for the cluster submission node. Run with Bash from any directory.
-if [[ "$#" != 0 ]]; then
-  printf '%s\n' 'Usage: bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh' >&2
+restore_args=()
+if [[ "$#" == 2 && ( "$1" == "--from-savepoint" || "$1" == "-s" ) && -n "$2" && "$2" != -* ]]; then
+  restore_args=(-s "$2")
+elif [[ "$#" != 0 ]]; then
+  printf '%s\n' 'Usage: bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh [--from-savepoint PATH]' >&2
   exit 2
 fi
 
@@ -30,6 +33,9 @@ done
 
 /opt/java11/bin/java -version
 printf '%s\n' 'Submitting yx2602-heartbeat-storage to YARN. Keep the Application ID and Tracking URL printed below.'
+if [[ "${#restore_args[@]}" != 0 ]]; then
+  printf 'Restoring Flink state and Kafka positions from: %s\n' "${restore_args[1]}"
+fi
 
 exec /opt/flink-1.20.5/bin/flink run-application \
   -t yarn-application \
@@ -44,5 +50,6 @@ exec /opt/flink-1.20.5/bin/flink run-application \
   -Dclassloader.parent-first-patterns.additional=org.apache.kafka. \
   -Dyarn.ship-files=/home/xiong/projects/YX2602_FAULTRECOG/config/local.properties \
   -c com.hitachi.yx2602.heartbeat.HeartbeatReaderJob \
+  "${restore_args[@]}" \
   /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
   --config local.properties --run

@@ -8,6 +8,8 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 
 查找服务器数据位置：见 [Ignite实际持久化目录](docs/heartbeat-ignite.md#ignite实际持久化目录)。已核对 `AI-slave06` 的宿主机数据目录为 `/home/workdir/ignite2/standalone/ignite-data/db`，对应容器 `/opt/ignite/work/db`，位于挂载到 `/home` 的 `/dev/sdb1`（XFS）。文档包含心跳表完整目录、核查依据及查看命令。
 
+保留消费积压并将并行度从2调整为3：按 [保留积压调整并行度](docs/heartbeat-ignite.md#保留积压调整并行度) 先停止并生成Savepoint，再用启动脚本的 `--from-savepoint` 参数恢复；无需重新打包JAR。
+
 ## 实现范围
 
 ```text

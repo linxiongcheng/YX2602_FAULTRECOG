@@ -50,7 +50,7 @@
 | HISTORY_POLICY_VERSION | 写入时采用的策略版本；固定配置为0，动态配置为正整数 |
 | FLINK_SEQUENCE | 解析层输出的historySequence |
 | PORT | 原心跳端口1～3 |
-| RECEIVED_AT_MS / PARSED_AT_MS / STORED_AT_MS | 接收、解析和写入时间，毫秒 |
+| RECEIVED_AT_MS / PARSED_AT_MS / STORED_AT_MS | 接收、解析阶段和构造入库内容的时间，毫秒；STORED_AT_MS不是精确的事务提交完成时间 |
 | SOURCE_TOPIC / SOURCE_PARTITION / SOURCE_OFFSET | Kafka来源坐标 |
 | KAFKA_TIMESTAMP_MS | Kafka记录时间 |
 | IntId / FId / Code | 文档中的终端IntId、自增主键和IMSI码 |
@@ -64,6 +64,78 @@
 缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV2`。启动检查缓存存在性、事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型。程序只访问已有缓存。
 
 客户端无法仅凭缓存配置证明服务端已开启持久化。`--check-ignite` 的成功只证明连接、ACTIVE状态和上述结构符合要求；服务端持久化和WAL设置由现有服务管理员核实。
+
+### 新增辅助字段说明
+
+除文档定义的41个心跳业务字段外，`HB_STATE` 另有16个辅助字段，用于管理最新状态与有限历史、处理时间、追踪处理过程和Kafka来源。这些字段由程序生成或从消息元数据中提取，不代表新增的电梯状态。
+
+#### 最新状态与历史管理（4个字段）
+
+| 字段 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `SLOT` | INT | 存储槽位，与业务字段 `EID` 组成主键。`-1`固定保存最新状态；`0～N−1`保存最近N条历史。槽位会循环使用，不是时间顺序或累计记录数。 |
+| `DB_SEQUENCE` | BIGINT | 数据库为每台电梯成功接受的新状态递增的序号，从1开始；重复或旧状态不递增。用于历史排序和计算覆盖槽位，不是全表统一序号，也不是当前保存行数。 |
+| `HISTORY_LIMIT` | INT | 本条状态写入时采用的历史保留上限N，例如10。`SLOT=-1`记录该梯当前已应用的上限；历史行保留写入当时的值。 |
+| `HISTORY_POLICY_VERSION` | BIGINT | 本条状态采用的历史策略版本。固定配置为0，动态配置使用递增的正整数版本，防止刷新较慢的任务用旧配置覆盖新配置；不是心跳数据版本或数量。 |
+
+例如某台电梯已经接受到第12条新状态，保留上限为10：
+
+```text
+最新状态：SLOT=-1，DB_SEQUENCE=12
+历史状态：SLOT=0～9，合计保存DB_SEQUENCE=3～12的10条状态
+本次历史写入槽位：(12-1)%10=1
+```
+
+最新状态也包含在历史中，因此该梯最多占11行，其中两行包含第12条的业务状态。`DB_SEQUENCE=12`不表示当前保存12条。查询历史按 `DB_SEQUENCE` 或 `CREATED_TIME_MS` 排序，不按SLOT排序。调小N后，在该梯下一条有效新心跳到达时清理，离线电梯暂时保留旧上限；判断实际生效策略应查看 `SLOT=-1`。
+
+#### 业务时间辅助信息（3个字段）
+
+| 字段 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `CREATED_TIME_MS` | BIGINT | 将原始 `CreatedDate` 按Asia/Shanghai解释后转换成Unix毫秒时间戳，用于比较新旧、判断重复及过期。与CreatedDate表达同一业务时刻，不是入库时间。 |
+| `PART_DAY` | VARCHAR | 从CreatedDate提取的北京时间日期，格式 `yyyy-MM-dd`，方便按日期筛选；是普通查询列，不会自动按天分区、建表或删除数据。 |
+| `SEND_TIME_RAW` | VARCHAR | 原始SendTime字段值的JSON表示，保留其原始类型与内容以便排查格式问题；不是整条原始心跳JSON，也不参与新旧或过期判断。 |
+
+例如 `CREATEDDATE='2026/11/4 10:30:00'` 时，`PART_DAY='2026-11-04'`，`CREATED_TIME_MS`是同一北京时间对应的毫秒时间戳。业务时间始终以CreatedDate为准，不以SendTime或Kafka时间替代。
+
+#### 处理过程追踪（5个字段）
+
+| 字段 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `PORT` | INT | 单梯状态从原始心跳的第几个电梯端口拆出，取值1～3；不是网络连接端口号。 |
+| `FLINK_SEQUENCE` | BIGINT | Flink解析及排序层为该电梯接受的状态生成的 `historySequence`，用于追踪流处理过程。 |
+| `RECEIVED_AT_MS` | BIGINT | 程序接收消息时记录的Unix毫秒时间戳，不是设备产生心跳的业务时间。 |
+| `PARSED_AT_MS` | BIGINT | 解析、按电梯排序处理阶段接受该状态时记录的Unix毫秒时间戳。 |
+| `STORED_AT_MS` | BIGINT | 写入器构造本次数据库记录时记录的Unix毫秒时间戳，发生在事务提交之前，不是精确的提交完成时间。 |
+
+`FLINK_SEQUENCE`与 `DB_SEQUENCE` 分别由Flink状态和数据库管理，均按电梯计数。重新部署或恢复后两者可能不同，不应要求二者始终相等；数据库历史排序和槽位计算使用 `DB_SEQUENCE`。
+
+处理时间差可以辅助定位延迟，但不是纯计算耗时：例如 `PARSED_AT_MS-RECEIVED_AT_MS`可能包含上游排队及网络传输，`STORED_AT_MS-PARSED_AT_MS`可能包含队列等待和凑批时间。后者不包含后续完整事务提交耗时，跨机器比较也依赖时钟同步。
+
+#### Kafka来源追踪（4个字段）
+
+| 字段 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `SOURCE_TOPIC` | VARCHAR | 原始消息来自哪个Kafka Topic。 |
+| `SOURCE_PARTITION` | INT | 原始消息所在的Kafka分区号，例如2。 |
+| `SOURCE_OFFSET` | BIGINT | 原始消息在该分区中的偏移量，例如158963；只在对应Topic和分区内有意义，不是电梯心跳序号。 |
+| `KAFKA_TIMESTAMP_MS` | BIGINT | Kafka记录携带的毫秒时间戳；依Kafka配置可能表示生产时间或Broker追加时间，不能直接当成设备业务时间。 |
+
+`SOURCE_TOPIC + SOURCE_PARTITION + SOURCE_OFFSET`用于定位原始Kafka消息；能否回查取决于消息是否仍在Kafka保留期内。同一条原始消息可拆出多台电梯，因此多个状态可能具有相同来源坐标，但EID、PORT不同。
+
+#### 日常查询重点
+
+查看电梯当前状态主要关注EID、CreatedDate、楼层、方向、门锁和故障码等业务字段；检查历史保留是否正常，重点关注SLOT、DB_SEQUENCE、HISTORY_LIMIT。EID是电梯编号，INTID是终端编号，两者在当前映射中含义不同。辅助字段是当前存储实现的一部分，不应仅因不在业务页面展示就直接删列。
+
+```sql
+-- 各梯最新状态及当前已应用的保留策略。
+SELECT EID, CREATEDDATE, DB_SEQUENCE, HISTORY_LIMIT, HISTORY_POLICY_VERSION
+FROM PUBLIC.HB_STATE WHERE SLOT=-1 ORDER BY EID LIMIT 20;
+
+-- 将12345替换成实际电梯编号，查看历史及其Kafka来源。
+SELECT EID, SLOT, DB_SEQUENCE, CREATEDDATE, SOURCE_TOPIC, SOURCE_PARTITION, SOURCE_OFFSET
+FROM PUBLIC.HB_STATE WHERE EID=12345 AND SLOT>=0 ORDER BY DB_SEQUENCE;
+```
 
 ## 准备部署文件
 
@@ -271,6 +343,90 @@ hdfs dfs -mkdir -p /flink/checkpoints/heartbeat3-reader /flink/savepoints/heartb
 本次单表结构按新项目首次部署，先停止旧作业并创建HB_STATE，再提交新版JAR，不携带旧项目的Checkpoint/Savepoint。若需要从部署时的最新Kafka位置开始，使用新的消费组；沿用已有消费组会从其已提交位点开始，超过10分钟的数据仍会过滤。后续恢复本单表项目时，在上述JAR路径之前添加 `-s 实际保存点路径`。CreatedDate状态名为 `last-accepted-created-version-v1`，写入算子UID为 `heartbeat-ignite-sink-v1`。保留原 `parser.max.parallelism`。不要同时运行两个使用同一消费组的作业。
 
 预览消费过的正常消息没有入库。切换正式模式后，从恢复位点继续处理；不会自动补写预览期间的数据，也不会回填超过10分钟的历史。需要已有状态时，应等待设备上报新的心跳。
+
+## 跳过积压从最新消息重新启动
+
+已决定放弃当前未消费消息、从新心跳重新观察时，使用从未用过的新消费组，且不从Checkpoint/Savepoint恢复。此操作跳过初始化位点之前的所有消息，包括最近10分钟内的未消费消息；它不删除Kafka消息，不清除旧消费组的LAG，也不清空Ignite数据。
+
+1. 在当前Flink作业页面点击Cancel Job，等待旧作业停止；也可由运维按实际Application ID停止旧Application。确认旧作业不会继续运行后再提交新作业。
+2. 编辑服务器 `/home/xiong/projects/YX2602_FAULTRECOG/config/local.properties`，只修改消费组，例如 `kafka.group.id=heartbeat3-reader-realtime-20261105-01`。该名称只作为本次新组示例，如果已经使用过，换一个未使用的后缀。服务器当前的 `parallelism` 及其余配置保持原值，不要用本地文件整体覆盖服务器配置。
+3. 不带恢复参数执行：
+
+```bash
+bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh
+```
+
+代码会为新消费组缺失的各分区位点初始化到启动初始化时的末尾，之后消费新增消息。不能携带 `--from-savepoint` 或 `-s`，否则恢复的Source状态会优先于新组的起始位点。无需重新打包JAR，也无需删除原Checkpoint/Savepoint目录。
+
+Ignite已有最新状态和历史保留，后续按CreatedDate继续更新，`DB_SEQUENCE` 继续以库内值递增；Flink每梯状态及 `FLINK_SEQUENCE` 从新作业重新建立。验收时确认新Application为RUNNING、Checkpoint持续成功，并查看新消费组的LAG；旧消费组的积压仍然存在，不代表新作业没生效。等新组完成成功Checkpoint及Kafka位点提交后，再比较各分区LAG的变化。
+
+本次只重置消费起点，不代表写入吞吐提高。观察新的Sink队列和持续输入下的LAG；如果新组仍持续积压，继续排查写入性能。为判断这次重新起点的效果，建议暂时保持现有并行度及内存设置，避免同时改变多个参数。
+
+## 保留积压调整并行度
+
+本节将已有单表作业的 `parallelism=2` 调整为3，并保留Kafka积压、Flink每梯状态及Ignite已有数据。使用当前正在运行的同一JAR、消费组 `heartbeat3-reader`、算子UID和原来的 `parser.max.parallelism`（未配置时默认128）。这次只修改提交配置和启动脚本，不需要重新打包JAR。先将更新的 `bin/start-heartbeat.sh` 复制到服务器同一位置，该脚本已支持 `--from-savepoint PATH`（也支持 `-s PATH`）。
+
+### 1. 停止旧作业并生成保存点
+
+在提交服务器加载环境，使用当前运行作业的Application ID和JobID。截图中的旧ID只用于定位，执行前以当前YARN/Flink页面为准：
+
+```bash
+source /opt/flink-1.20.5/conf/cdh-env.sh
+export JAVA_HOME=/opt/java11
+export PATH=/opt/java11/bin:$PATH
+
+yarn application -list -appStates RUNNING
+
+export FLINK_APP_ID='application_替换为实际ID'
+export FLINK_JOB_ID='替换为当前FlinkJobID'
+
+hdfs dfs -mkdir -p /flink/savepoints/heartbeat3-reader
+
+/opt/flink-1.20.5/bin/flink stop \
+  -t yarn-application \
+  -Dyarn.application.id="$FLINK_APP_ID" \
+  --savepointPath hdfs:///flink/savepoints/heartbeat3-reader \
+  "$FLINK_JOB_ID"
+```
+
+等待命令成功并记录返回的完整保存点路径，例如 `hdfs:///flink/savepoints/heartbeat3-reader/savepoint-xxxxxx-xxxxxx`。确认旧作业已停止后再启动新作业。如果停止或保存点生成失败，先排查原因，不要用普通启动替代恢复。该操作不是Cancel，也不是 `yarn application -kill`；停止期间Kafka继续接收消息，恢复后仍按保存点位点读取。
+
+### 2. 修改服务器配置
+
+在服务器先备份配置文件，然后打开原文件，将唯一一处 `parallelism=2` 改为 `parallelism=3`：
+
+```bash
+cp -p /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties \
+  /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties.before-parallelism3
+
+vi /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties
+
+grep -E '^[[:space:]]*(parallelism|kafka.group.id|parser.max.parallelism)[[:space:]]*=' \
+  /home/xiong/projects/YX2602_FAULTRECOG/config/local.properties
+```
+
+应看到 `parallelism=3`、`kafka.group.id=heartbeat3-reader`。`parser.max.parallelism` 保持原值，原来未配置则继续不配置。只修改这一行，不用本地配置文件整体覆盖服务器的连接参数、凭据及目录。HDFS历史条数策略无需修改，配置同步进程保持运行。
+
+### 3. 从保存点启动3并行作业
+
+将下面引号内路径替换为步骤1实际返回的完整路径，不能只填写父目录：
+
+```bash
+bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
+  --from-savepoint 'hdfs:///flink/savepoints/heartbeat3-reader/替换为实际savepoint目录'
+```
+
+脚本把 `-s` 放在JAR路径之前传给Flink。仅修改 `local.properties` 不会使运行中的作业改变并行度；不带恢复参数重新提交也不会自动读取该保存点。恢复位点来自Savepoint，不重置Kafka消费位点、不换消费组、不清空Ignite表。
+
+脚本继续使用每个TaskManager 2个槽位。新作业需要至少3个可用槽位，Application模式通常会申请2个TaskManager（共4个槽位），具体以调度器和实际资源配置为准。YARN应有容纳额外TaskManager及Java进程的资源和容器环境；若因资源不足处于等待状态，应检查YARN资源分配，而不是继续重复提交。输入Topic有3个分区，3并行可使每个Source子任务处理1个分区，并将Ignite写入器从2个增加为3个，但吞吐量是否提高仍需运行验证。
+
+### 4. 验收与回退
+
+确认Flink作业为RUNNING，Source和排序/Sink链并行度均为3；Checkpoints页面的Last Restore指向本次保存点，后续Checkpoint继续成功。分别观察3个子任务的 `igniteQueuedRecords`、`igniteCommittedRows`、`igniteSkippedRows` 以及Kafka各分区LAG，比较相同时间窗口的变化。队列持续接近1024或LAG长期增加，仍需定位写入吞吐瓶颈。
+
+保留积压表示继续读取这些消息；现有 `CreatedDate` 超过10分钟过滤规则仍然执行，并不保证积压消息全部入库。Ignite的数据库序号与最近N条历史继续使用库内状态。
+
+如果3并行运行效果更差且需要回退，先对3并行作业执行停止并生成新的Savepoint，改回 `parallelism=2`，从这个最新保存点恢复。不要重新启动旧作业与新作业并行消费。
 
 ## 运行验收与日志
 

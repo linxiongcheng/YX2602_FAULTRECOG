@@ -3,7 +3,6 @@ __pycache__/
 .reference/
 .runtime/
 .pytest_cache/
-config/local.properties
 target/
 *.log
 *.history-sync.lock

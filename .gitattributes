@@ -1,0 +1,2 @@
+# Deployment scripts run on Linux even when checked out on Windows.
+bin/*.sh text eol=lf
