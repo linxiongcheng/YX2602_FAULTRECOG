@@ -21,11 +21,13 @@ class HeartbeatLogCollectorTest {
                 + " [HEARTBEAT-PERF] stage=" + stage + " input=10\n";
     }
 
-    @Test @org.junit.jupiter.api.Timeout(45)
-    void readsDedicatedMonitorFileThroughActualFlinkRestEndpoint() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    @org.junit.jupiter.api.Timeout(45)
+    void readsOnlyAvailableLogsThroughActualFlinkRestEndpoint(boolean rotated) throws Exception {
         Path container = Files.createDirectory(directory.resolve("container"));
         Files.writeString(container.resolve("taskmanager.log"), "regular Flink log\n");
-        Files.writeString(container.resolve("heartbeat-monitor.log.1"), line("aaaa", 1, "validation"));
+        if (rotated) Files.writeString(container.resolve("heartbeat-monitor.log.1"), line("aaaa", 1, "validation"));
         Files.writeString(container.resolve("heartbeat-monitor.log"), line("aaaa", 2, "ignite_sink"));
         org.apache.flink.configuration.Configuration config = new org.apache.flink.configuration.Configuration();
         config.set(org.apache.flink.configuration.TaskManagerOptions.TASK_MANAGER_LOG_PATH,
@@ -40,10 +42,15 @@ class HeartbeatLogCollectorTest {
             int added = 0;
             long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(15);
             while (added == 0 && System.nanoTime() < deadline) {
-                added = collector.collectOnce();
+                try { added = collector.collectOnce(); }
+                catch (IOException startup) {
+                    // The embedded REST leader can still be unavailable immediately after start().
+                    // Do not swallow the HTTP 500 that reproduces a missing-log regression.
+                    if (!"Flink HTTP status 503".equals(startup.getMessage())) throw startup;
+                }
                 if (added == 0) Thread.sleep(100);
             }
-            assertEquals(2, added);
+            assertEquals(rotated ? 2 : 1, added);
             assertEquals(0, collector.collectOnce());
         }
         // Flink 1.20's named-log upload leaves FileInputStream cleanup to the JVM cleaner.
@@ -64,6 +71,8 @@ class HeartbeatLogCollectorTest {
     @Test void collectsMultipleManagersRotatedLogsAndResumesWithoutDuplicates() throws Exception {
         Map<String, String> responses = new ConcurrentHashMap<>();
         responses.put("/taskmanagers", "{\"taskmanagers\":[{\"id\":\"tm1\"},{\"id\":\"tm2\"}]}");
+        responses.put("/taskmanagers/tm1/logs", "{\"logs\":[{\"name\":\"heartbeat-monitor.log.1\"},{\"name\":\"heartbeat-monitor.log\"}]}");
+        responses.put("/taskmanagers/tm2/logs", "{\"logs\":[{\"name\":\"heartbeat-monitor.log\"}]}");
         responses.put("/taskmanagers/tm1/logs/heartbeat-monitor.log.1", line("aaaa", 1, "validation"));
         responses.put("/taskmanagers/tm1/logs/heartbeat-monitor.log", line("aaaa", 2, "split"));
         responses.put("/taskmanagers/tm2/logs/heartbeat-monitor.log", line("bbbb", 1, "ignite_sink"));
@@ -94,6 +103,51 @@ class HeartbeatLogCollectorTest {
             assertEquals(5, Files.readAllLines(output).size());
             responses.remove("/taskmanagers");
             assertThrows(IOException.class, restored::collectOnce);
+        } finally { server.stop(0); }
+    }
+
+    @Test void discoversNewLogsAndDoesNotHideActualHttpFailures() throws Exception {
+        Map<String, String> responses = new ConcurrentHashMap<>();
+        Map<String, Integer> statuses = new ConcurrentHashMap<>();
+        Map<String, Integer> requests = new ConcurrentHashMap<>();
+        String logs = "/taskmanagers/tm1/logs";
+        String current = logs + "/heartbeat-monitor.log";
+        String previous = current + ".1";
+        responses.put("/taskmanagers", "{\"taskmanagers\":[{\"id\":\"tm1\"}]}");
+        responses.put(logs, "{\"logs\":[]}");
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            requests.merge(path, 1, Integer::sum);
+            String body = responses.get(path);
+            byte[] bytes = (body == null ? "FileNotFoundException" : body).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(statuses.getOrDefault(path, body == null ? 500 : 200), bytes.length);
+            try (java.io.OutputStream output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        try {
+            HeartbeatLogCollector collector = new HeartbeatLogCollector(
+                    "http://127.0.0.1:" + server.getAddress().getPort(), "application_123_6", directory);
+            for (int i = 0; i < 12; i++) assertEquals(0, collector.collectOnce());
+            assertFalse(requests.containsKey(current));
+            assertFalse(requests.containsKey(previous));
+            responses.put(logs, "{\"logs\":[{\"name\":\"heartbeat-monitor.log\"}]}");
+            responses.put(current, line("aaaa", 1, "validation"));
+            assertEquals(1, collector.collectOnce());
+            assertFalse(requests.containsKey(previous));
+            responses.put(logs, "{\"logs\":[{\"name\":\"heartbeat-monitor.log\"},{\"name\":\"heartbeat-monitor.log.1\"}]}");
+            responses.put(previous, line("aaaa", 1, "validation") + line("aaaa", 2, "split"));
+            responses.put(current, line("aaaa", 3, "ignite_sink"));
+            assertEquals(2, collector.collectOnce());
+            assertEquals(0, collector.collectOnce());
+            statuses.put(current, 500);
+            assertTrue(assertThrows(IOException.class, collector::collectOnce).getMessage().contains("500"));
+            statuses.clear();
+            statuses.put(logs, 503);
+            assertTrue(assertThrows(IOException.class, collector::collectOnce).getMessage().contains("503"));
+            statuses.clear();
+            responses.put(logs, "{}");
+            assertThrows(IOException.class, collector::collectOnce);
         } finally { server.stop(0); }
     }
 

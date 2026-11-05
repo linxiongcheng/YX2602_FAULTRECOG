@@ -16,7 +16,9 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -69,7 +71,7 @@ public final class HeartbeatLogCollector {
                 } catch (IOException error) {
                     failures++;
                     System.err.println(Instant.now() + " collector_retry=" + failures + "/10 error="
-                            + error.getClass().getSimpleName());
+                            + error.getClass().getSimpleName() + " message=" + error.getMessage());
                 }
                 if (failures < 10) Thread.sleep(30000);
             }
@@ -88,10 +90,25 @@ public final class HeartbeatLogCollector {
             String id = manager.path("id").asText();
             if (id.isEmpty()) continue;
             String encoded = java.net.URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20");
+            String logPath = "/taskmanagers/" + encoded + "/logs";
+            Set<String> available = new HashSet<>();
+            try {
+                byte[] files = get(logPath, 1024 * 1024);
+                if (files == null) continue; // TaskManager may have disappeared since the first listing.
+                JsonNode logs = JSON.readTree(files).path("logs");
+                if (!logs.isArray()) throw new IOException("Unexpected TaskManager log listing: " + id);
+                for (JsonNode log : logs) available.add(log.path("name").asText());
+            } catch (IOException error) {
+                pending = error;
+                continue;
+            }
             // Read the previous generation before the current one to preserve each JVM's event sequence.
+            // Flink 1.20 returns HTTP 500 (and logs an ERROR) for a missing named file.
+            // The rotated file, and initially even the current file, may not exist yet.
             for (String name : new String[]{"heartbeat-monitor.log.1", "heartbeat-monitor.log"}) {
+                if (!available.contains(name)) continue;
                 try {
-                    byte[] data = get("/taskmanagers/" + encoded + "/logs/" + name, 2 * 1024 * 1024);
+                    byte[] data = get(logPath + "/" + name, 2 * 1024 * 1024);
                     if (data != null) added += appendEvents(new String(data, StandardCharsets.UTF_8));
                 } catch (IOException error) { pending = error; }
             }

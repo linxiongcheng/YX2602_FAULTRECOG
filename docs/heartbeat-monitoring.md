@@ -75,6 +75,8 @@ tail -n 50 /home/xiong/projects/YX2602_FAULTRECOG/logs/collector-application_实
 
 连续10轮不能正常访问Flink REST时汇总进程退出，作业退出后通常也通过此方式停止。JobManager故障切换改变REST地址时，可用新地址重新启动汇总进程。PID文件记录的是提交节点汇总进程，不是YARN容器进程。
 
+2026-11-05修复：先调用 `/taskmanagers/:id/logs` 获取文件列表，再按上一份、当前文件的顺序下载实际存在的监控日志。未轮转时没有 `heartbeat-monitor.log.1` 属于正常情况，不再请求该文件，避免Flink 1.20返回HTTP 500并在JobManager记录FileNotFoundException。首次摘要尚未生成时也跳过缺失文件；后续每轮重新发现文件。真正的HTTP失败仍记录并重试，不统一忽略500。列表查询与下载之间文件恰好消失的竞争仍可能导致一次失败，下轮重新发现。部署及不停作业更新方法见 [采集器修复](log-collector-fix.md)。
+
 这是诊断日志的尽力汇总：访问失败、轮转覆盖、TaskManager提前退出或收集器长时间停机可能造成缺段；追加后保存去重位置前崩溃，也可能重放少量行。它不参与业务提交，不作为心跳账本。原始日志仍可通过Flink/YARN查看。当前收集器支持可直接访问的HTTP(S)接口，受SPNEGO等认证保护的REST需要先适配认证访问。
 
 ### 原始TaskManager与YARN日志

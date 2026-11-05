@@ -22,6 +22,7 @@ class PackagedIgniteIT {
         server.createContext("/", exchange -> {
             String path = exchange.getRequestURI().getPath();
             String text = path.equals("/taskmanagers") ? "{\"taskmanagers\":[{\"id\":\"tm1\"}]}"
+                    : path.equals("/taskmanagers/tm1/logs") ? "{\"logs\":[{\"name\":\"heartbeat-monitor.log\"}]}"
                     : path.endsWith("/heartbeat-monitor.log")
                     ? "event_id=aaaa:1 [HEARTBEAT-PERF] stage=ignite_sink committed=10\n" : null;
             byte[] data = (text == null ? "not found" : text).getBytes(StandardCharsets.UTF_8);
