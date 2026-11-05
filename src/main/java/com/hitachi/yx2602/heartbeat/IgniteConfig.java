@@ -19,11 +19,13 @@ public final class IgniteConfig implements Serializable {
     public final boolean sslEnabled;
     public final int requestTimeoutMs, transactionTimeoutMs, attempts, batchSize, queueCapacity;
     public final long retryDelayMs, lingerMs, flushTimeoutMs;
+    public final long monitorLogIntervalMs;
     public final int historyMaxRecords, historyRefreshIntervalMs;
     public final String historyConfigPath;
     final boolean historyMaxRecordsExplicit;
 
     IgniteConfig(Properties p, long checkpointTimeoutMs) {
+        monitorLogIntervalMs = HeartbeatDiagnostics.interval(p);
         addresses = p.getProperty("ignite.addresses", "").trim();
         username = p.getProperty("ignite.username", "").trim();
         password = p.getProperty("ignite.password", "");

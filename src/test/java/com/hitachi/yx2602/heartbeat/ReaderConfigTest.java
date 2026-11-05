@@ -24,6 +24,8 @@ class ReaderConfigTest {
         assertEquals(60000, config.futureSkewMs);
         assertEquals(600000, config.parserMaxAgeMs);
         assertEquals(128, config.parserMaxParallelism);
+        assertEquals(30000, config.monitorLogIntervalMs);
+        assertEquals(config.monitorLogIntervalMs, config.ignite.monitorLogIntervalMs);
         assertEquals("false", config.consumerProperties().getProperty("enable.auto.commit"));
         assertEquals("all", config.producerProperties().getProperty("acks"));
         assertEquals("true", config.producerProperties().getProperty("enable.idempotence"));

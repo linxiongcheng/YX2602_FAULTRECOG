@@ -157,6 +157,7 @@ class IgniteStoreTest {
         final java.util.Map<String, Integer> calls = new java.util.LinkedHashMap<>();
         final List<Long> latestReads = new ArrayList<>();
         boolean failAfterBulkWrite;
+        java.util.function.Consumer<String> beforeCall = name -> { };
 
         CacheProbe(IgniteHeartbeatStore store) throws Exception {
             java.lang.reflect.Field cache = IgniteHeartbeatStore.class.getDeclaredField("states");
@@ -166,6 +167,7 @@ class IgniteStoreTest {
                     org.apache.ignite.client.ClientCache.class.getClassLoader(),
                     new Class<?>[]{org.apache.ignite.client.ClientCache.class}, (ignored, method, args) -> {
                         calls.merge(method.getName(), 1, Integer::sum);
+                        beforeCall.accept(method.getName());
                         if (method.getName().equals("get")) {
                             org.apache.ignite.binary.BinaryObject key = (org.apache.ignite.binary.BinaryObject) args[0];
                             if (Integer.valueOf(-1).equals(key.field("SLOT"))) latestReads.add(key.field("EID"));
@@ -182,6 +184,42 @@ class IgniteStoreTest {
         }
 
         int count(String name) { return calls.getOrDefault(name, 0); }
+    }
+
+    @Test void diagnosticReportIdentifiesBlockedBulkCallBeforeTransactionCanCommit() throws Exception {
+        java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong();
+        List<String> logs = new ArrayList<>();
+        java.util.concurrent.CountDownLatch entered = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try (HeartbeatDiagnostics monitor = new HeartbeatDiagnostics("ignite_sink", "subtask=0/1 attempt=0",
+                1000, clock::get, logs::add);
+             IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings, monitor)) {
+            CacheProbe probe = new CacheProbe(store);
+            probe.beforeCall = name -> {
+                if (!name.equals("putAll")) return;
+                entered.countDown();
+                try { assertTrue(release.await(5, TimeUnit.SECONDS)); }
+                catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new RuntimeException(error); }
+            };
+            CompletableFuture<Integer> writing = CompletableFuture.supplyAsync(() -> {
+                try { return store.write(rows(update(77, 1, 1))); }
+                catch (Exception error) { throw new RuntimeException(error); }
+            });
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                clock.set(TimeUnit.MILLISECONDS.toNanos(500));
+                String blocked = monitor.snapshot();
+                assertTrue(blocked.contains("latest_read_samples=1"), blocked);
+                assertTrue(blocked.contains("bulk_write_active_ms=500"), blocked);
+                assertFalse(blocked.contains("commit_samples="), blocked);
+            } finally { release.countDown(); }
+            assertEquals(1, writing.get(5, TimeUnit.SECONDS));
+            clock.set(TimeUnit.SECONDS.toNanos(1));
+            String finished = monitor.snapshot();
+            assertTrue(finished.contains("bulk_write_samples=1"), finished);
+            assertTrue(finished.contains("commit_samples=1"), finished);
+            assertTrue(finished.contains("bulk_write_active_ms=0"), finished);
+        } finally { release.countDown(); }
     }
 
     @Test void distinctElevatorBatchUsesOrderedReadsAndOneBulkWrite() throws Exception {

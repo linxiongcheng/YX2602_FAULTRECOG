@@ -23,6 +23,7 @@ public final class ReaderConfig implements Serializable {
     public final int parallelism, restartAttempts, deliveryTimeoutMs, maxRequestBytes;
     public final long futureSkewMs, checkpointIntervalMs, checkpointTimeoutMs, restartDelayMs;
     public final long parserMaxAgeMs;
+    public final long monitorLogIntervalMs;
     public final int parserMaxParallelism;
     public final IgniteConfig ignite;
     private final Properties connectionProperties = new Properties();
@@ -33,7 +34,7 @@ public final class ReaderConfig implements Serializable {
                 "checkpoint.storage", "job.name", "parallelism", "validation.max.future.skew.ms",
                 "checkpoint.interval.ms", "checkpoint.timeout.ms", "kafka.delivery.timeout.ms",
                 "restart.attempts", "restart.delay.ms", "kafka.error.max.request.bytes",
-                "parser.max.age.ms", "parser.max.parallelism"));
+                "parser.max.age.ms", "parser.max.parallelism", "monitor.log.interval.ms"));
         for (String key : p.stringPropertyNames()) {
             if (key.startsWith("kafka.client.")) {
                 String clientKey = key.substring("kafka.client.".length());
@@ -62,6 +63,7 @@ public final class ReaderConfig implements Serializable {
         jobName = p.getProperty("job.name", "yx2602-heartbeat-reader").trim();
         if (jobName.isEmpty()) throw new IllegalArgumentException("job.name不能为空");
         parallelism = Math.toIntExact(number(p, "parallelism", 2, 1));
+        monitorLogIntervalMs = HeartbeatDiagnostics.interval(p);
         parserMaxAgeMs = number(p, "parser.max.age.ms", 600000, 0);
         parserMaxParallelism = Math.toIntExact(number(p, "parser.max.parallelism", 128, 1));
         if (parserMaxParallelism < parallelism || parserMaxParallelism > 32768) {

@@ -14,6 +14,7 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
     private final Store store;
     private final ArrayBlockingQueue<Object> queue;
     private final Thread worker;
+    private final HeartbeatDiagnostics diagnostics;
     private volatile Throwable failure;
     private volatile boolean stopped;
     final AtomicLong committed = new AtomicLong(), skipped = new AtomicLong();
@@ -22,9 +23,20 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
     final AtomicLong lastCommitAtMs = new AtomicLong();
 
     AsyncHeartbeatWriter(IgniteConfig config, Store store) {
+        this(config, store, HeartbeatDiagnostics.disabled());
+    }
+
+    AsyncHeartbeatWriter(IgniteConfig config, Store store, HeartbeatDiagnostics diagnostics) {
         this.config = config;
         this.store = store;
+        this.diagnostics = diagnostics;
         queue = new ArrayBlockingQueue<>(config.queueCapacity);
+        diagnostics.gauge("queued", this::queued);
+        diagnostics.gauge("queue_capacity", () -> config.queueCapacity);
+        diagnostics.gauge("committed_total", committed::get);
+        diagnostics.gauge("skipped_total", skipped::get);
+        diagnostics.gauge("last_commit_at_ms", lastCommitAtMs::get);
+        diagnostics.gauge("writer_failed", () -> failure == null ? 0 : 1);
         worker = new Thread(this::run, "heartbeat-ignite-writer");
         worker.setDaemon(true);
         worker.start();
@@ -32,7 +44,13 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
 
     void submit(ElevatorUpdate update) throws Exception {
         // 入队前复制字段，避免 Flink 复用或后续修改原对象影响后台线程写入。
-        enqueue(IgniteHeartbeatStore.Row.copyOf(update), deadline());
+        long copied = diagnostics.begin("snapshot_copy");
+        IgniteHeartbeatStore.Row row;
+        try { row = IgniteHeartbeatStore.Row.copyOf(update); }
+        finally { diagnostics.end("snapshot_copy", copied); }
+        long started = diagnostics.begin("enqueue");
+        try { enqueue(row, deadline()); }
+        finally { diagnostics.end("enqueue", started); }
     }
 
     void flush() throws Exception {
@@ -78,7 +96,16 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
                 if (stopped) break;
                 // write 返回代表事务已提交；若失败则由 failure 传回 Flink，不能提前确认屏障。
                 long started = System.nanoTime();
-                int accepted = store.write(batch);
+                diagnostics.add("batch_records", batch.size());
+                long now = System.currentTimeMillis();
+                if (diagnostics.enabled()) for (IgniteHeartbeatStore.Row row : batch) {
+                    diagnostics.sampleMs("buffer_wait", TimeUnit.NANOSECONDS.toMillis(started - row.bufferedAtNanos));
+                    diagnostics.sampleMs("created_age_before_write", now - row.createdTimeMs);
+                }
+                long measured = diagnostics.begin("batch_write");
+                int accepted;
+                try { accepted = store.write(batch); }
+                finally { diagnostics.end("batch_write", measured); }
                 long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
                 committed.addAndGet(accepted);
                 skipped.addAndGet(batch.size() - accepted);
@@ -87,10 +114,18 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
                 lastBatchDurationMs.set(elapsedMs);
                 lastCommitAtMs.set(System.currentTimeMillis());
                 completedBatches.incrementAndGet();
+                diagnostics.add("committed", accepted);
+                diagnostics.add("skipped", batch.size() - accepted);
+                diagnostics.add("batches", 1);
+                now = System.currentTimeMillis();
+                if (diagnostics.enabled()) for (IgniteHeartbeatStore.Row row : batch) {
+                    diagnostics.sampleMs("created_age_after_batch", now - row.createdTimeMs);
+                }
                 if (barrier != null) barrier.countDown();
             }
         } catch (Throwable error) {
             failure = error;
+            diagnostics.add("writer_failures", 1);
         } finally {
             try { store.close(); }
             catch (Throwable error) { if (failure == null) failure = error; }

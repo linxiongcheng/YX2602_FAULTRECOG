@@ -36,11 +36,17 @@ import java.util.Set;
 final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     private final IgniteConfig config;
     private final IgniteConfig.HistorySettings historySettings;
+    private final HeartbeatDiagnostics diagnostics;
     private IgniteClient client;
     private ClientCache<BinaryObject, BinaryObject> states;
 
     IgniteHeartbeatStore(IgniteConfig config) {
+        this(config, HeartbeatDiagnostics.disabled());
+    }
+
+    IgniteHeartbeatStore(IgniteConfig config, HeartbeatDiagnostics diagnostics) {
         this.config = config;
+        this.diagnostics = diagnostics;
         config.requireAddresses();
         historySettings = new IgniteConfig.HistorySettings(config);
         try { connect(); }
@@ -48,6 +54,12 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     }
 
     private void connect() {
+        long started = diagnostics.begin("connect");
+        try { connectClient(); }
+        finally { diagnostics.end("connect", started); }
+    }
+
+    private void connectClient() {
         ClientConfiguration connection = new ClientConfiguration()
                 .setAddresses(java.util.Arrays.stream(config.addresses.split(",")).map(String::trim).toArray(String[]::new))
                 .setTimeout(config.requestTimeoutMs)
@@ -76,10 +88,14 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                 if (client == null) connect();
                 return writeTransaction(rows);
             } catch (ClientException failure) {
+                diagnostics.add("client_failures", 1);
                 // 连接异常可能发生在提交已成功但响应丢失之后；整批重试由库内时间比较防止重复写入。
                 disconnect();
                 if (attempt >= config.attempts) throw failure;
-                Thread.sleep(config.retryDelayMs);
+                diagnostics.add("retries", 1);
+                long started = diagnostics.begin("retry_backoff");
+                try { Thread.sleep(config.retryDelayMs); }
+                finally { diagnostics.end("retry_backoff", started); }
             }
         }
     }
@@ -88,8 +104,8 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
         int accepted = 0;
         // 一批只读取一次配置快照，配置刷新不会改变已开始事务的策略。
         IgniteConfig.HistoryPolicy requested = historySettings.current();
-        try (ClientTransaction tx = client.transactions().txStart(TransactionConcurrency.PESSIMISTIC,
-                TransactionIsolation.REPEATABLE_READ, config.transactionTimeoutMs)) {
+        diagnostics.add("transaction_attempts", 1);
+        try (ClientTransaction tx = startTransaction()) {
             Map<BinaryObject, BinaryObject> pending = new LinkedHashMap<>();
             BinaryObject latestKey = null;
             BinaryObject previous = null;
@@ -100,7 +116,9 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                     latestKey = stateKey(elevatorId, Schema.LATEST_SLOT);
                     // 仍按电梯ID顺序获取固定键的事务锁，包括不存在的键。
                     // 同梯后续记录复用批内状态，避免重复网络读取；锁一直持有到提交。
-                    previous = states.get(latestKey);
+                    long started = diagnostics.begin("latest_read");
+                    try { previous = states.get(latestKey); }
+                    finally { diagnostics.end("latest_read", started); }
                 }
                 // 数据库再次比较 CreatedDate，拦截检查点恢复重放以及事务重试产生的重复或旧数据。
                 if (previous != null && row.createdTimeMs <= (Long) previous.field("CREATED_TIME_MS")) continue;
@@ -119,10 +137,26 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                 previous = value;
                 accepted++;
             }
-            if (!pending.isEmpty()) states.putAll(pending);
-            tx.commit();
+            if (!pending.isEmpty()) {
+                long started = diagnostics.begin("bulk_write");
+                try { states.putAll(pending); }
+                finally { diagnostics.end("bulk_write", started); }
+            }
+            long started = diagnostics.begin("commit");
+            try { tx.commit(); }
+            finally { diagnostics.end("commit", started); }
+        } catch (RuntimeException error) {
+            diagnostics.add("transaction_failures", 1);
+            throw error;
         }
         return accepted;
+    }
+
+    private ClientTransaction startTransaction() {
+        long started = diagnostics.begin("transaction_start");
+        try { return client.transactions().txStart(TransactionConcurrency.PESSIMISTIC,
+                TransactionIsolation.REPEATABLE_READ, config.transactionTimeoutMs); }
+        finally { diagnostics.end("transaction_start", started); }
     }
 
     private IgniteConfig.HistoryPolicy effectivePolicy(BinaryObject previous, IgniteConfig.HistoryPolicy requested) {
@@ -140,6 +174,12 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     }
 
     private void resizeHistory(long elevatorId, int oldLimit, int newLimit) {
+        long started = diagnostics.begin("history_resize");
+        try { resizeHistoryRows(elevatorId, oldLimit, newLimit); }
+        finally { diagnostics.end("history_resize", started); }
+    }
+
+    private void resizeHistoryRows(long elevatorId, int oldLimit, int newLimit) {
         IgniteConfig.historyLimit(oldLimit);
         Set<BinaryObject> oldKeys = new HashSet<>();
         // 只调整非负历史槽位，始终保留用于串行化同梯事务的-1固定槽位。
@@ -288,6 +328,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     static final class Row {
         final long elevatorId;
         final long createdTimeMs;
+        final long bufferedAtNanos = System.nanoTime();
         final Map<String, Object> values;
 
         private Row(ElevatorUpdate update) {

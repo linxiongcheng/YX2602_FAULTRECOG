@@ -81,7 +81,7 @@ public final class HeartbeatReader {
         SingleOutputStreamOperator<HeartbeatMessage> valid = env
                 .fromSource(source, WatermarkStrategy.noWatermarks(), "heartbeat-kafka-source")
                 .uid("heartbeat-kafka-source-v1")
-                .process(new ValidationFunction(config.futureSkewMs))
+                .process(new ValidationFunction(config.futureSkewMs, config.monitorLogIntervalMs))
                 .name("heartbeat-validation").uid("heartbeat-validation-v1");
         attachErrorSink(valid.getSideOutput(ValidationFunction.ERRORS), config,
                 "heartbeat-error-kafka", "heartbeat-error-kafka-v1");
@@ -158,15 +158,22 @@ public final class HeartbeatReader {
         private static final long serialVersionUID = 1L;
         public static final OutputTag<String> ERRORS = new OutputTag<String>("heartbeat-errors-v1") { };
         private final long futureSkewMs;
+        private final long monitorIntervalMs;
+        private transient HeartbeatDiagnostics diagnostics;
         private transient HeartbeatValidator validator;
         private transient Counter accepted, rejected;
         private transient Map<String, Counter> reasons;
 
-        public ValidationFunction(long futureSkewMs) { this.futureSkewMs = futureSkewMs; }
+        public ValidationFunction(long futureSkewMs) { this(futureSkewMs, 30000); }
+        public ValidationFunction(long futureSkewMs, long monitorIntervalMs) {
+            this.futureSkewMs = futureSkewMs; this.monitorIntervalMs = monitorIntervalMs;
+        }
 
         @Override
         public void open(OpenContext context) {
             validator = new HeartbeatValidator(futureSkewMs);
+            diagnostics = HeartbeatDiagnostics.forTask("validation", getRuntimeContext(), monitorIntervalMs);
+            diagnostics.start();
             MetricGroup metrics = getRuntimeContext().getMetricGroup().addGroup("heartbeat_reader");
             accepted = metrics.counter("accepted");
             rejected = metrics.counter("rejected");
@@ -179,15 +186,31 @@ public final class HeartbeatReader {
 
         @Override
         public void processElement(RawHeartbeat record, Context ctx, Collector<HeartbeatMessage> out) {
-            HeartbeatValidator.Result result = validator.validate(record, System.currentTimeMillis());
+            diagnostics.add("input", 1);
+            diagnostics.observedOffset(record.partition, record.offset);
+            long now = System.currentTimeMillis();
+            if (record.kafkaTimestampMs > 0) diagnostics.sampleMs("kafka_age", now - record.kafkaTimestampMs);
+            long started = diagnostics.begin("validate");
+            HeartbeatValidator.Result result;
+            try { result = validator.validate(record, now); }
+            finally { diagnostics.end("validate", started); }
             if (result.valid != null) {
                 accepted.inc();
-                out.collect(result.valid);
+                diagnostics.add("accepted", 1);
+                diagnostics.sampleMs("created_age", now - result.valid.createdTimeMs);
+                started = diagnostics.begin("emit");
+                try { out.collect(result.valid); }
+                finally { diagnostics.end("emit", started); }
             } else {
                 rejected.inc();
                 reasons.get(result.errorCode).inc();
-                ctx.output(ERRORS, result.errorJson);
+                diagnostics.add("rejected", 1);
+                started = diagnostics.begin("emit");
+                try { ctx.output(ERRORS, result.errorJson); }
+                finally { diagnostics.end("emit", started); }
             }
         }
+
+        @Override public void close() { if (diagnostics != null) diagnostics.close(); }
     }
 }
