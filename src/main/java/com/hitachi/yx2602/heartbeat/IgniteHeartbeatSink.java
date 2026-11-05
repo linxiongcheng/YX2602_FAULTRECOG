@@ -27,6 +27,11 @@ public final class IgniteHeartbeatSink extends RichSinkFunction<ElevatorUpdate> 
         getRuntimeContext().getMetricGroup().gauge("igniteCommittedRows", (Gauge<Long>) writer.committed::get);
         getRuntimeContext().getMetricGroup().gauge("igniteSkippedRows", (Gauge<Long>) writer.skipped::get);
         getRuntimeContext().getMetricGroup().gauge("igniteQueuedRecords", (Gauge<Integer>) writer::queued);
+        getRuntimeContext().getMetricGroup().gauge("igniteCompletedBatches", (Gauge<Long>) writer.completedBatches::get);
+        getRuntimeContext().getMetricGroup().gauge("igniteWriteTimeMs", (Gauge<Long>) writer.writeTimeMs::get);
+        getRuntimeContext().getMetricGroup().gauge("igniteLastBatchSize", (Gauge<Long>) writer.lastBatchSize::get);
+        getRuntimeContext().getMetricGroup().gauge("igniteLastBatchDurationMs", (Gauge<Long>) writer.lastBatchDurationMs::get);
+        getRuntimeContext().getMetricGroup().gauge("igniteLastCommitAtMs", (Gauge<Long>) writer.lastCommitAtMs::get);
         getRuntimeContext().getMetricGroup().gauge("igniteHistoryMaxRecords", (Gauge<Integer>) () -> store.historyPolicy().maxRecords);
         getRuntimeContext().getMetricGroup().gauge("igniteHistoryConfigVersion", (Gauge<Long>) () -> store.historyPolicy().version);
         getRuntimeContext().getMetricGroup().gauge("igniteHistoryConfigRefreshFailed",

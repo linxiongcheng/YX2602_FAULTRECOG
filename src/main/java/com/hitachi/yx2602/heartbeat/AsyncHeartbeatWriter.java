@@ -17,6 +17,9 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
     private volatile Throwable failure;
     private volatile boolean stopped;
     final AtomicLong committed = new AtomicLong(), skipped = new AtomicLong();
+    final AtomicLong completedBatches = new AtomicLong(), writeTimeMs = new AtomicLong();
+    final AtomicLong lastBatchSize = new AtomicLong(), lastBatchDurationMs = new AtomicLong();
+    final AtomicLong lastCommitAtMs = new AtomicLong();
 
     AsyncHeartbeatWriter(IgniteConfig config, Store store) {
         this.config = config;
@@ -74,9 +77,16 @@ final class AsyncHeartbeatWriter implements AutoCloseable {
                 }
                 if (stopped) break;
                 // write 返回代表事务已提交；若失败则由 failure 传回 Flink，不能提前确认屏障。
+                long started = System.nanoTime();
                 int accepted = store.write(batch);
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
                 committed.addAndGet(accepted);
                 skipped.addAndGet(batch.size() - accepted);
+                writeTimeMs.addAndGet(elapsedMs);
+                lastBatchSize.set(batch.size());
+                lastBatchDurationMs.set(elapsedMs);
+                lastCommitAtMs.set(System.currentTimeMillis());
+                completedBatches.incrementAndGet();
                 if (barrier != null) barrier.countDown();
             }
         } catch (Throwable error) {

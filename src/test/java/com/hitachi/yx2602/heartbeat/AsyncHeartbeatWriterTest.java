@@ -39,6 +39,8 @@ class AsyncHeartbeatWriterTest {
             update.state.speed = 7L;
             writer.submit(update);
             assertTrue(entered.await(5, TimeUnit.SECONDS));
+            assertEquals(0, writer.completedBatches.get());
+            assertEquals(0, writer.lastCommitAtMs.get());
             update.state.speed = 999L; update.elevatorId = 99;
             CompletableFuture<Void> snapshot = CompletableFuture.runAsync(() -> {
                 try { writer.flush(); } catch (Exception e) { throw new RuntimeException(e); }
@@ -48,6 +50,10 @@ class AsyncHeartbeatWriterTest {
             snapshot.get(5, TimeUnit.SECONDS);
             assertEquals(1, committed.get(0).elevatorId);
             assertEquals(7L, committed.get(0).values.get("SPEED"));
+            assertEquals(1, writer.completedBatches.get());
+            assertEquals(1, writer.lastBatchSize.get());
+            assertTrue(writer.lastCommitAtMs.get() > 0);
+            assertEquals(writer.lastBatchDurationMs.get(), writer.writeTimeMs.get());
         } finally { release.countDown(); }
     }
 
@@ -73,6 +79,7 @@ class AsyncHeartbeatWriterTest {
             release.countDown(); third.get(5, TimeUnit.SECONDS); writer.flush();
             assertEquals(3, committed.size());
             assertEquals(3, committed.get(2).createdTimeMs);
+            assertEquals(3, writer.completedBatches.get());
         } finally { release.countDown(); }
     }
 
@@ -87,6 +94,8 @@ class AsyncHeartbeatWriterTest {
             IOException error = assertThrows(IOException.class, writer::flush);
             assertEquals("injected database failure", error.getCause().getMessage());
             assertEquals(0, writer.committed.get());
+            assertEquals(0, writer.completedBatches.get());
+            assertEquals(0, writer.lastCommitAtMs.get());
         }
     }
 }

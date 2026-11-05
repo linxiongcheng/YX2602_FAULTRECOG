@@ -90,10 +90,18 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
         IgniteConfig.HistoryPolicy requested = historySettings.current();
         try (ClientTransaction tx = client.transactions().txStart(TransactionConcurrency.PESSIMISTIC,
                 TransactionIsolation.REPEATABLE_READ, config.transactionTimeoutMs)) {
+            Map<BinaryObject, BinaryObject> pending = new LinkedHashMap<>();
+            BinaryObject latestKey = null;
+            BinaryObject previous = null;
+            long elevatorId = 0;
             for (Row row : rows) {
-                // 悲观事务的可重复读也锁定不存在的键，避免并发首次写入都取得序号 1。
-                BinaryObject latestKey = stateKey(row.elevatorId, Schema.LATEST_SLOT);
-                BinaryObject previous = states.get(latestKey);
+                if (latestKey == null || elevatorId != row.elevatorId) {
+                    elevatorId = row.elevatorId;
+                    latestKey = stateKey(elevatorId, Schema.LATEST_SLOT);
+                    // 仍按电梯ID顺序获取固定键的事务锁，包括不存在的键。
+                    // 同梯后续记录复用批内状态，避免重复网络读取；锁一直持有到提交。
+                    previous = states.get(latestKey);
+                }
                 // 数据库再次比较 CreatedDate，拦截检查点恢复重放以及事务重试产生的重复或旧数据。
                 if (previous != null && row.createdTimeMs <= (Long) previous.field("CREATED_TIME_MS")) continue;
                 // 数据库序号独立递增，不依赖 Flink 恢复后的序号。
@@ -104,11 +112,14 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                 }
                 BinaryObject value = value(row, sequence, effective);
                 BinaryObject key = stateKey(row.elevatorId, (int) ((sequence - 1) % effective.maxRecords));
-                // 同一缓存中，-1固定槽位与历史槽位、序号一起提交，避免只更新部分状态。
-                states.put(latestKey, value);
-                states.put(key, value);
+                // 按原始到达顺序逐条判断和递增序号；仅合并同一事务内对同一槽位的覆盖。
+                // 最终历史与逐条put一致，但只将槽位最终值通过一次putAll发往服务端。
+                pending.put(latestKey, value);
+                pending.put(key, value);
+                previous = value;
                 accepted++;
             }
+            if (!pending.isEmpty()) states.putAll(pending);
             tx.commit();
         }
         return accepted;

@@ -152,6 +152,101 @@ class IgniteStoreTest {
                 + elevatorId + " AND DB_SEQUENCE=" + to));
     }
 
+    /** Count calls at the actual thin-client boundary while still using the real persistent server. */
+    private static final class CacheProbe {
+        final java.util.Map<String, Integer> calls = new java.util.LinkedHashMap<>();
+        final List<Long> latestReads = new ArrayList<>();
+        boolean failAfterBulkWrite;
+
+        CacheProbe(IgniteHeartbeatStore store) throws Exception {
+            java.lang.reflect.Field cache = IgniteHeartbeatStore.class.getDeclaredField("states");
+            cache.setAccessible(true);
+            Object delegate = cache.get(store);
+            Object proxy = java.lang.reflect.Proxy.newProxyInstance(
+                    org.apache.ignite.client.ClientCache.class.getClassLoader(),
+                    new Class<?>[]{org.apache.ignite.client.ClientCache.class}, (ignored, method, args) -> {
+                        calls.merge(method.getName(), 1, Integer::sum);
+                        if (method.getName().equals("get")) {
+                            org.apache.ignite.binary.BinaryObject key = (org.apache.ignite.binary.BinaryObject) args[0];
+                            if (Integer.valueOf(-1).equals(key.field("SLOT"))) latestReads.add(key.field("EID"));
+                        }
+                        Object result;
+                        try { result = method.invoke(delegate, args); }
+                        catch (java.lang.reflect.InvocationTargetException error) { throw error.getCause(); }
+                        if (failAfterBulkWrite && method.getName().equals("putAll")) {
+                            throw new IllegalStateException("injected failure after real bulk writes");
+                        }
+                        return result;
+                    });
+            cache.set(store, proxy);
+        }
+
+        int count(String name) { return calls.getOrDefault(name, 0); }
+    }
+
+    @Test void distinctElevatorBatchUsesOrderedReadsAndOneBulkWrite() throws Exception {
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+            CacheProbe probe = new CacheProbe(store);
+            List<IgniteHeartbeatStore.Row> input = new ArrayList<>();
+            for (int id = 128; id >= 1; id--) input.addAll(rows(update(id, 1, 1)));
+            assertEquals(128, store.write(input));
+            System.out.println("128-elevator thin-client calls: " + probe.calls);
+            assertEquals(128, probe.count("get"));
+            assertEquals(1, probe.count("putAll"));
+            assertEquals(0, probe.count("put"));
+            for (int id = 1; id <= 128; id++) assertEquals((long) id, probe.latestReads.get(id - 1));
+            assertEquals(256L, query("SELECT COUNT(*) FROM HB_STATE").get(0).get(0));
+        }
+    }
+
+    @Test void repeatedElevatorBatchReadsOnceAndPreservesEveryAcceptedSequence() throws Exception {
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+            CacheProbe probe = new CacheProbe(store);
+            List<IgniteHeartbeatStore.Row> input = rows(update(77, 1, 1), update(77, 1, 2));
+            for (int n = 2; n <= 128; n++) {
+                input.addAll(rows(update(77, n, n + 10), update(77, n - 1, n + 20)));
+            }
+            assertEquals(128, store.write(input));
+            System.out.println("One-elevator thin-client calls: " + probe.calls);
+            assertEquals(1, probe.count("get"));
+            assertEquals(1, probe.count("putAll"));
+            assertEquals(0, probe.count("put"));
+            assertHistory(77, 119, 128);
+            probe.calls.clear();
+            assertEquals(0, store.write(rows(update(77, 128, 1), update(77, 127, 2))));
+            assertEquals(1, probe.count("get"));
+            assertEquals(0, probe.count("putAll"));
+        }
+    }
+
+    @Test void bulkWriteFailureRollsBackChangesAlreadySentToServer() throws Exception {
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+            store.write(rows(update(1, 1, 1), update(2, 1, 1)));
+            CacheProbe probe = new CacheProbe(store);
+            probe.failAfterBulkWrite = true;
+            assertThrows(IllegalStateException.class,
+                    () -> store.write(rows(update(1, 2, 2), update(2, 2, 2))));
+            assertEquals(1, probe.count("putAll"));
+            assertHistory(1, 1, 1);
+            assertHistory(2, 1, 1);
+        }
+    }
+
+    @Test void resizedBatchKeepsNewestHistoryWithDuplicatesAndMoreUpdatesThanSlots() throws Exception {
+        Path file = directory.resolve("batch-history.properties"); policyFile(file, 1, 10);
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(dynamicConfig(file))) {
+            writeRange(store, 77, 1, 10);
+            policyFile(file, 2, 3); awaitPolicy(store, 2);
+            List<IgniteHeartbeatStore.Row> input = rows(update(77, 10, 20), update(77, 11, 21), update(77, 10, 22));
+            for (int n = 12; n <= 18; n++) input.addAll(rows(update(77, n, n + 20)));
+            assertEquals(8, store.write(input));
+            assertHistory(77, 16, 18);
+            policyFile(file, 3, 6); awaitPolicy(store, 3);
+            writeRange(store, 77, 19, 21);
+            assertHistory(77, 16, 21);
+        }
+    }
+
     @ParameterizedTest @ValueSource(ints = {1, 2, 3})
     void documentFieldsRoundTripFromEachPortToBothSlotKinds(int port) throws Exception {
         // 独立按文档的拆分后41个字段构造输入/期望值，验证真实解析到SQL存储的字段对应关系。
@@ -339,6 +434,28 @@ class IgniteStoreTest {
         assertEquals(2L, latest.get(0));
         assertEquals(latest.get(1), query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=88").get(0).get(0));
         assertEquals(latest.get(1), query("SELECT MAX(DB_SEQUENCE) FROM HB_STATE WHERE SLOT>=0 AND eid=88").get(0).get(0));
+    }
+
+    @Test void overlappingBatchesLockElevatorsInTheSameOrderAndKeepNewestState() throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int n = 1; n <= 2; n++) {
+            final int time = n;
+            futures.add(CompletableFuture.runAsync(() -> {
+                try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+                    barrier.await(10, TimeUnit.SECONDS);
+                    store.write(time == 1
+                            ? rows(update(1, time, time), update(2, time, time), update(3, time, time))
+                            : rows(update(3, time, time), update(2, time, time), update(1, time, time)));
+                } catch (Exception error) { throw new RuntimeException(error); }
+            }));
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30, TimeUnit.SECONDS);
+        for (int id = 1; id <= 3; id++) {
+            List<?> latest = query("SELECT CREATED_TIME_MS, DB_SEQUENCE FROM HB_STATE WHERE SLOT=-1 AND eid=" + id).get(0);
+            assertEquals(2L, latest.get(0));
+            assertEquals(latest.get(1), query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0 AND eid=" + id).get(0).get(0));
+        }
     }
 
     @Test void durableRestartKeepsLatestAndHistorySlotsAndExistingClientCanReconnect() throws Exception {

@@ -22,15 +22,49 @@
 
 事务使用 Ignite Java thin client 的缓存 API，模式为 `PESSIMISTIC + REPEATABLE_READ`。SQL用于手工建表与查询。每批事务按电梯ID排序获取锁，同一电梯的输入顺序保持不变：
 
-1. 事务内读取并锁定该梯 `SLOT=-1` 的最新状态，包括尚不存在的复合主键；两个并发首次写入也按这个固定键串行处理。
+1. 事务内按电梯ID顺序读取并锁定该梯 `SLOT=-1` 的最新状态，包括尚不存在的复合主键；每批每梯只读取一次，两个并发首次写入也按这个固定键串行处理。
 2. `createdTimeMs <= 数据库最新CREATED_TIME_MS` 时忽略，不递增序号，不写历史。
 3. 新记录的 `DB_SEQUENCE = 旧值 + 1`，首条为1。
 4. 根据配置版本和该梯已应用版本确定N；N变化时，在事务内取出旧历史、保留最近的至多N−1条，并按新N重排槽位，为新记录预留一格。
-5. 历史槽位 `SLOT = (DB_SEQUENCE - 1) % N`，范围0～N−1。同一快照写入 `SLOT=-1` 和对应历史槽位，连同策略版本、历史重排一起提交；任何异常都回滚。调整历史时只操作非负槽位，不能删除最新状态的固定槽位。
+5. 历史槽位 `SLOT = (DB_SEQUENCE - 1) % N`，范围0～N−1。同一快照暂存为 `SLOT=-1` 和对应历史槽位的新值。同梯后续记录使用批内最新状态逐条判定，序号逐条递增；批末将全部槽位最终值通过一次 `putAll` 写入，连同策略版本、历史重排一起提交；任何异常都回滚。调整历史时只操作非负槽位，不能删除最新状态的固定槽位。
 
 数据库序号与 Flink 的 `historySequence` 分开：后者保存为 `FLINK_SEQUENCE`，用于追踪。数据库可能已提交，但对应Flink检查点未完成；重放时依靠数据库CreatedDate时间过滤，不能使用恢复后的Flink序号覆盖历史槽位。
 
 例如N=10时，数据库已经写到第12条，恢复后的Flink重放第9～12条时均跳过；下一个更晚的状态使用数据库序号13，覆盖槽位2。此时数据库保留序号4～13。
+
+## 写入吞吐优化与验收
+
+2026-11-05优化客户端批内写入：保持按电梯ID顺序读取并持有事务锁，每台电梯在一批内只远程读取一次；最新状态与历史槽位先在批内计算，最终通过一次 `putAll` 提交到缓存。相同时间及旧状态仍跳过；每条接受记录均递增序号，历史最终内容与原逐条写入一致。批内对相同槽位的中间覆盖不再逐次发送到服务器。
+
+| 正常批次场景 | 优化前Cache API调用 | 优化后Cache API调用 |
+| --- | --- | --- |
+| 128台不同电梯各1条新心跳 | 128次get + 256次put，共384次 | 128次get + 1次putAll，共129次 |
+| 同一电梯连续128条新心跳 | 128次get + 256次put，共384次 | 1次get + 1次putAll，共2次 |
+
+统计不含事务开始/提交、连接与元数据请求、重试及历史上限调整；是客户端API调用次数，不是磁盘I/O次数或吞吐倍数。大量不同电梯的业务数据仍需落盘，这次改动不能保证解除服务端存储瓶颈。按默认批大小128，最终待写入集合最多256个槽位；正常事务仍为 `PESSIMISTIC + REPEATABLE_READ`，读取的固定键锁保持到批量写入提交结束。
+
+新增运行指标：`igniteLastBatchDurationMs` 查看最近成功批次的写入耗时，`igniteLastBatchSize` 查看实际批大小。两次采样的 `igniteWriteTimeMs` 增量除以 `igniteCompletedBatches` 增量，得到该窗口平均批次耗时（分母非零时）；`igniteCommittedRows` 增量除以采样秒数，得到接受的单梯心跳数/秒。批次耗时含事务执行、连接重试等 `store.write` 时间，不含前面的排队及凑批时间。最后成功返回时间由 `igniteLastCommitAtMs` 记录；没有输入时该时间不变属于正常现象。
+
+### 更新与效果对比
+
+这次优化需要更新JAR；表结构、配置键、算子UID和Flink状态结构沿用当前单表版本，可以从本单表作业Savepoint恢复。操作顺序：
+
+1. 先记录当前消费组、并行度、两个相隔60秒的入库指标、队列、Checkpoint耗时及各分区LAG；确认比较的单位为单梯心跳，Kafka消息可能拆成多梯。
+2. 按 [Checkpoint与Savepoint](#checkpoint与savepoint) 执行停止并生成Savepoint，等待成功，记录完整路径并确认旧作业停止。
+3. 备份服务器旧JAR，再将新 `target/heartbeat-reader-0.1.0.jar` 与其 `.sha256` 文件复制到 `/home/xiong/projects/YX2602_FAULTRECOG/target/`。如果启动脚本尚未更新，一并更新 `bin/start-heartbeat.sh`。不要执行重建表操作，不要用示例或本地配置覆盖服务器的 `local.properties`。
+4. 在服务器校验后，从步骤2保存点恢复：
+
+```bash
+cd /home/xiong/projects/YX2602_FAULTRECOG/target
+sha256sum -c heartbeat-reader-0.1.0.jar.sha256
+
+bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
+  --from-savepoint '替换为本次完整Savepoint路径'
+```
+
+验收时保持原消费组、并行度、批大小和内存，先比较这次代码更新的效果。确认Checkpoint持续成功，窗口入库吞吐是否提高、队列是否下降，并比较相同Checkpoint提交阶段的LAG及最近活跃电梯的端到端时间差。稳定的已提交LAG可能包含检查点提交周期带来的差距，不能直接当作所有消息都未读取。若磁盘仍长时间排队且实际数据延迟超标，需要Ignite服务管理员继续排查WAL及数据盘、共享I/O竞争；新增客户端指标不能证明磁盘上限。
+
+2026-11-05在Java 11执行离线 `mvn -o -B -ntp clean verify`，157项测试全部通过，无失败、错误或跳过。本地验证覆盖真实持久化Ignite的批量写入、同梯批内重复与乱序、循环历史、扩缩容、已发送到服务端后失败的事务回滚、并发重叠批次，以及最终打包JAR独立进程运行；集群吞吐改善需按上述步骤验收。保留原有CreatedDate过期过滤规则，超过10分钟的积压仍会被过滤。
 
 ## 表与字段
 
@@ -568,7 +602,7 @@ grep -nE -B 8 -A 20 \
 
 ## 检查点、重试与运维
 
-每个sink子任务有一个写入线程、有界FIFO队列和批次缓冲。默认队列最多1024条、活动批次最多128条；最多等待200ms收集一批。同一电梯在批次内和批次间均保持输入顺序，不合并丢弃中间状态。队列满时阻塞上游，超过flush等待上限则失败恢复。
+每个sink子任务有一个写入线程、有界FIFO队列和批次缓冲。默认队列最多1024条、活动批次最多128条；最多等待200ms收集一批。同一电梯在批次内和批次间均保持输入顺序，逐条判断新旧和递增序号；只合并事务内对同一槽位的覆盖，保留历史的最终内容不变。队列满时阻塞上游，超过flush等待上限则失败恢复。
 
 检查点将屏障排入同一队列，等待此前全部事务提交后才能成功。小批次在等待时间到达、检查点或正常结束时都会提交。取消作业时不主动刷新剩余缓冲；未完成检查点的数据由Flink恢复重放。
 
@@ -581,6 +615,11 @@ grep -nE -B 8 -A 20 \
 | igniteCommittedRows | 本次运行中确认新接受的行数 |
 | igniteSkippedRows | 数据库判定重复或旧状态的行数 |
 | igniteQueuedRecords | 队列当前长度，可能含一个检查点屏障，不含活动批次 |
+| igniteCompletedBatches | 成功完成的批次数，包含整批均为重复/旧状态的情况 |
+| igniteWriteTimeMs | 成功批次的累计写入耗时，含重试，不含排队/凑批时间 |
+| igniteLastBatchSize | 最近成功批次输入的单梯心跳数，包含被跳过的记录 |
+| igniteLastBatchDurationMs | 最近成功批次的写入耗时，毫秒 |
+| igniteLastCommitAtMs | 最近成功批次返回后的平台Unix毫秒时间，尚无成功批次时为0 |
 | igniteHistoryMaxRecords | 当前子任务从配置加载的目标历史条数 |
 | igniteHistoryConfigVersion | 当前子任务加载的策略版本，固定配置为0 |
 | igniteHistoryConfigRefreshFailed | 最近一次刷新失败为1，成功为0 |
