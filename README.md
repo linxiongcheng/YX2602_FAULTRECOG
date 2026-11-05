@@ -14,6 +14,8 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 
 定位积压：新版默认每30秒输出读取校验、分梯解析、新旧判断、Ignite写入的性能摘要，分别统计纯计算、输出等待、入队和读写/提交耗时；配置与日志判读见 [性能日志与积压定位](docs/heartbeat-monitoring.md)。
 
+新版启动脚本自动将各TaskManager监控日志汇总到提交节点 `/home/xiong/projects/YX2602_FAULTRECOG/logs/heartbeat-monitor-<ApplicationID>.log`。需同步更新JAR和两个脚本，通过Flink现有REST接口读取，不依赖YARN运行期日志聚合。
+
 ## 实现范围
 
 ```text
@@ -50,7 +52,7 @@ Kafka 原始心跳（bytes，保留来源坐标）
 
 ## 工程结构
 
-生产代码共17个Java文件。阅读主流程时，依次查看 `HeartbeatReaderJob → HeartbeatReader → HeartbeatParser → IgniteHeartbeatSink`。各模块内部辅助逻辑放在所属文件中，跨模块使用的数据模型保持独立。
+生产代码共18个Java文件。阅读主流程时，依次查看 `HeartbeatReaderJob → HeartbeatReader → HeartbeatParser → IgniteHeartbeatSink`。各模块内部辅助逻辑放在所属文件中，跨模块使用的数据模型保持独立。
 
 ```text
 src/main/java/com/hitachi/yx2602/heartbeat/
@@ -66,6 +68,7 @@ src/main/java/com/hitachi/yx2602/heartbeat/
   AsyncHeartbeatWriter.java     有界异步队列、批处理、提交屏障及内部存储接口
   IgniteHeartbeatStore.java     表结构校验、不可变写入快照、最新/历史事务与重试
   HeartbeatDiagnostics.java     独立定时摘要、阶段计时、吞吐与积压定位日志
+  HeartbeatLogCollector.java    提交节点通过Flink REST汇总容器监控日志
   RawHeartbeat.java             Kafka原始字节和来源坐标
   HeartbeatMessage.java         校验后未分梯的心跳
   ElevatorState.java            可空业务字段

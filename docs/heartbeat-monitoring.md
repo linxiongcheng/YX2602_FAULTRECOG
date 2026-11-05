@@ -14,7 +14,7 @@ monitor.log.interval.ms=30000
 
 不填写时默认30000毫秒，每个阶段、每个子任务约30秒一条摘要；0关闭性能摘要及本模块的检查点事件日志，允许范围为0或1000～3600000。配置在启动时读取，修改需重新提交，不属于历史条数热更新。建议先使用30秒；短时间定位时可调为10秒。
 
-输出使用SLF4J INFO，logger为 `com.hitachi.yx2602.heartbeat.HeartbeatDiagnostics`。若集群根日志级别为WARN/ERROR，请在实际使用的Log4j2配置中为该logger单独开启INFO：
+输出同时写入容器独立监控文件和SLF4J INFO，logger为 `com.hitachi.yx2602.heartbeat.HeartbeatDiagnostics`。汇总文件不受SLF4J根日志级别影响；若还需在普通TaskManager日志中查看，而根日志级别为WARN/ERROR，请在实际使用的Log4j2配置中为该logger单独开启INFO：
 
 ```properties
 logger.heartbeatPerf.name = com.hitachi.yx2602.heartbeat.HeartbeatDiagnostics
@@ -24,6 +24,58 @@ logger.heartbeatPerf.level = INFO
 每阶段使用独立定时线程，业务线程卡住或没有新输入时仍能定期输出。统计只记录阶段、数值、任务身份和分区位点，不输出心跳原文、认证参数或密码。不逐条打印心跳；线程退出时另外输出最后一段窗口摘要。采集和格式化有少量开销，正式环境建议保持默认周期。
 
 ## 日志在哪里
+
+### 提交节点固定目录自动汇总
+
+更新本次JAR、`bin/start-heartbeat.sh` 和新增的 `bin/collect-heartbeat-logs.sh` 后，启动脚本自动创建提交节点目录：
+
+```text
+/home/xiong/projects/YX2602_FAULTRECOG/logs/
+```
+
+| 文件 | 内容 |
+| --- | --- |
+| `heartbeat-monitor.log` | 指向最近启动Application监控文件的便捷链接；已有同名普通文件时保留原文件 |
+| `heartbeat-monitor-application_实际ID.log` | 各TaskManager的性能摘要和检查点事件，按Application分文件追加 |
+| `collector-application_实际ID.log` | 汇总进程状态、新增条数及错误重试 |
+| `submit-日期时间-进程号.log` | 本次Flink提交输出及Application ID |
+| `collector-application_实际ID.pid` | 提交节点汇总进程的PID |
+| `.heartbeat-monitor-application_实际ID.offsets.json` | 事件去重位置，供汇总进程重启接续 |
+
+启动方式不变，仍可带 `--from-savepoint`。提交成功后脚本解析Application ID和Flink REST地址，用Java 11在提交节点启动一个独立后台进程（最大堆128MB），每30秒读取容器独立监控文件。不占Flink槽位，不需要Python、jq、新监听端口或YARN运行期日志聚合。提交节点必须能访问该Flink REST地址。
+
+容器独立文件位于 `-Dlog.file` 对应的TaskManager日志目录，名为 `heartbeat-monitor.log`，约256KiB轮转并保留上一份。Flink REST日志接口需能访问该目录，标准YARN布局下它与普通TaskManager日志位于同一目录。日志携带进程唯一事件ID和递增序号，汇总时按ID去重，事件时间使用北京时间。最终目录在运行启动脚本的提交节点，不要求各YARN节点共享项目目录。
+
+首批摘要产生并被轮询后（通常约30～60秒），直接查看最近启动作业：
+
+```bash
+tail -F /home/xiong/projects/YX2602_FAULTRECOG/logs/heartbeat-monitor.log
+```
+
+查看某个指定Application时，替换实际ID：
+
+```bash
+tail -F /home/xiong/projects/YX2602_FAULTRECOG/logs/heartbeat-monitor-application_实际ID.log
+```
+
+作业已运行但尚未汇总时，无需再次提交Flink。确认运行的JAR已是本次支持容器独立文件的版本，在提交节点执行：
+
+```bash
+bash /home/xiong/projects/YX2602_FAULTRECOG/bin/collect-heartbeat-logs.sh \
+  application_实际ID http://实际Flink主机:实际REST端口
+```
+
+地址使用提交输出中的 `Found Web Interface`，不是Ignite端口。脚本不能解析地址或汇总进程启动失败时会提示，Flink提交成功的结果保持不变；不要为修复汇总进程再次提交作业。排查汇总状态：
+
+```bash
+tail -n 50 /home/xiong/projects/YX2602_FAULTRECOG/logs/collector-application_实际ID.log
+```
+
+连续10轮不能正常访问Flink REST时汇总进程退出，作业退出后通常也通过此方式停止。JobManager故障切换改变REST地址时，可用新地址重新启动汇总进程。PID文件记录的是提交节点汇总进程，不是YARN容器进程。
+
+这是诊断日志的尽力汇总：访问失败、轮转覆盖、TaskManager提前退出或收集器长时间停机可能造成缺段；追加后保存去重位置前崩溃，也可能重放少量行。它不参与业务提交，不作为心跳账本。原始日志仍可通过Flink/YARN查看。当前收集器支持可直接访问的HTTP(S)接口，受SPNEGO等认证保护的REST需要先适配认证访问。
+
+### 原始TaskManager与YARN日志
 
 这些日志位于执行算子的TaskManager日志中。通过Flink Web UI进入对应TaskManager的Logs查看；YARN启用日志聚合且当前日志可获取时，也可在提交节点执行：
 
@@ -36,7 +88,7 @@ grep -E '\[HEARTBEAT-PERF\]|\[HEARTBEAT-CHECKPOINT\]' \
   /home/xiong/projects/YX2602_FAULTRECOG/heartbeat-perf.log
 ```
 
-不在提交脚本输出里逐条显示。运行中的日志尚未聚合时，使用Flink/YARN页面查看容器日志。先核对Application、日志中的job、attempt和subtask，避免混入旧作业或已失败尝试的数据。
+启动脚本终端不是业务监控日志流，实时查看优先使用上面的固定目录。运行中的YARN日志尚未聚合时，也可使用Flink/YARN页面查看容器日志。先核对Application、日志中的job、attempt和subtask，避免混入旧作业或已失败尝试的数据。
 
 ## 日志格式
 
@@ -131,3 +183,5 @@ commit_samples=240 commit_total_ms=7200.000 commit_avg_ms=30.000 commit_max_ms=1
 2026-11-05使用Java 11执行离线 `mvn -o -B -ntp clean verify`，171项测试通过，无失败、错误或跳过。新增测试验证窗口速率与重置、计算和emit计时分离、跨窗口未完成调用、关闭监控、日志输出异常隔离、配置范围，以及真实Ignite批量调用被阻塞时的阶段识别。另验证写入线程和入队线程同时阻塞时，独立定时摘要仍然输出。最终JAR的独立写库和配置发布入口均通过验证。
 
 本地测试不等同于集群吞吐测量或生产根因确认；上线后按同一时间段的阶段摘要、Flink指标和服务端I/O监控交叉定位。
+
+固定目录汇总版本同日在Java 11下重新执行离线 `mvn -o -B -ntp clean verify`，177项测试全部通过。新增验证包括真实Flink 1.20.5 REST读取独立日志及轮转文件、多TaskManager汇总、重复轮询和进程重启去重、不完整日志行，以及不带Flink库的最终打包收集器运行。两个脚本通过Bash语法与LF检查；提交成功/失败、保存点参数、REST地址发现与回退、收集器失败隔离共6种模拟场景通过验证。实际集群的REST连通性与认证仍需部署时确认。

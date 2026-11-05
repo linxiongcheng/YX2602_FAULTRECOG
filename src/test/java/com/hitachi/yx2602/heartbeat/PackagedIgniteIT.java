@@ -16,6 +16,34 @@ import static org.junit.jupiter.api.Assertions.*;
 class PackagedIgniteIT {
     @TempDir Path directory;
 
+    @Test @Timeout(30) void packagedLogCollectorRunsWithoutFlinkLibraries() throws Exception {
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String text = path.equals("/taskmanagers") ? "{\"taskmanagers\":[{\"id\":\"tm1\"}]}"
+                    : path.endsWith("/heartbeat-monitor.log")
+                    ? "event_id=aaaa:1 [HEARTBEAT-PERF] stage=ignite_sink committed=10\n" : null;
+            byte[] data = (text == null ? "not found" : text).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(text == null ? 404 : 200, data.length);
+            try (java.io.OutputStream output = exchange.getResponseBody()) { output.write(data); }
+        });
+        server.start();
+        Path log = directory.resolve("collector.log"), output = directory.resolve("logs");
+        try {
+            Process process = new ProcessBuilder(Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-cp", Paths.get("target/heartbeat-reader-0.1.0.jar").toAbsolutePath().toString(),
+                    HeartbeatLogCollector.class.getName(), "--rest-url", "http://127.0.0.1:" + server.getAddress().getPort(),
+                    "--application-id", "application_1_1", "--output-dir", output.toString(), "--once")
+                    .redirectErrorStream(true).redirectOutput(log.toFile()).start();
+            try {
+                assertTrue(process.waitFor(20, TimeUnit.SECONDS));
+                assertEquals(0, process.exitValue(), Files.readString(log));
+                assertTrue(Files.readString(output.resolve("heartbeat-monitor-application_1_1.log")).contains("committed=10"));
+            } finally { if (process.isAlive()) process.destroyForcibly(); }
+        } finally { server.stop(0); }
+    }
+
     @Test @Timeout(30) void packagedEntryGeneratesHistoryPolicyWithoutManualVersion() throws Exception {
         Path source = directory.resolve("local.properties"), target = directory.resolve("history.properties");
         java.util.Properties properties = ReaderConfigTest.properties();

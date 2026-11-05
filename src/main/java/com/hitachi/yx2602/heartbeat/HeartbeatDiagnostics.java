@@ -53,7 +53,10 @@ final class HeartbeatDiagnostics implements AutoCloseable {
     }
 
     HeartbeatDiagnostics(String stage, String identity, long intervalMs) {
-        this(stage, identity, intervalMs, System::nanoTime, message -> Logging.LOG.info("{}", message));
+        this(stage, identity, intervalMs, System::nanoTime, message -> {
+            ContainerFile.write(message);
+            Logging.LOG.info("{}", message);
+        });
     }
 
     HeartbeatDiagnostics(String stage, String identity, long intervalMs, LongSupplier clock, Consumer<String> output) {
@@ -167,5 +170,42 @@ final class HeartbeatDiagnostics implements AutoCloseable {
     // Flink supplies SLF4J. Standalone config checks/publishers must not load it merely to parse settings.
     private static final class Logging {
         static final Logger LOG = LoggerFactory.getLogger(HeartbeatDiagnostics.class);
+    }
+
+    /** One bounded log per container, fetched through Flink's existing TaskManager log endpoint. */
+    static final class ContainerFile {
+        private static final java.nio.file.Path PATH = path();
+        private static final String STREAM = java.util.UUID.randomUUID().toString();
+        private static final AtomicLong SEQUENCE = new AtomicLong();
+        private static boolean warned;
+
+        private static java.nio.file.Path path() {
+            String mainLog = System.getProperty("log.file", "");
+            if (mainLog.isEmpty()) return null;
+            return java.nio.file.Paths.get(mainLog).toAbsolutePath().getParent().resolve("heartbeat-monitor.log");
+        }
+
+        static synchronized void write(String line) {
+            if (PATH == null) return;
+            try {
+                String entry = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Shanghai"))
+                        + " event_id=" + STREAM + ":" + SEQUENCE.incrementAndGet() + " " + line + "\n";
+                append(PATH, entry, 256 * 1024);
+            } catch (java.io.IOException | RuntimeException error) {
+                if (!warned) {
+                    warned = true;
+                    Logging.LOG.warn("[HEARTBEAT-PERF] container_log_error={}", error.getClass().getSimpleName());
+                }
+            }
+        }
+
+        static void append(java.nio.file.Path path, String entry, long limit) throws java.io.IOException {
+            byte[] bytes = entry.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            if (java.nio.file.Files.exists(path) && java.nio.file.Files.size(path) + bytes.length > limit) {
+                java.nio.file.Files.move(path, path.resolveSibling(path.getFileName() + ".1"),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            java.nio.file.Files.write(path, bytes, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        }
     }
 }

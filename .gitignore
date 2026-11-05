@@ -7,4 +7,5 @@ target/
 *.log
 *.history-sync.lock
 dist/
+logs/
 
