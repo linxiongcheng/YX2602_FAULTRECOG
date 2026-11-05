@@ -143,4 +143,33 @@ class HeartbeatSplitterTest {
         assertTrue(preview.path("state").get("speed").isNull());
         assertEquals("0007", preview.path("state").get("mainFaultCode").asText());
     }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"null", "\"\"", "\"  \""})
+    void emptyUpdatedDateIsNull(String value) {
+        HeartbeatSplitter.Result result = splitter.split(message(NOW, "\"EId1\":11,\"UpdatedDate\":" + value), NOW);
+        assertTrue(result.errors.isEmpty());
+        assertNull(result.valid.get(0).state.updatedDate);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"123", "\"bad\"", "\"2026/2/30 12:00:00\"", "\"2026/11/5 24:00:00\"", "\"2026/11/5 12:00:00.1234\""})
+    void invalidUpdatedDateIsQuarantinedBeforeSink(String value) throws Exception {
+        HeartbeatSplitter.Result result = splitter.split(message(NOW,
+                "\"EId1\":11,\"EId3\":33,\"UpdatedDate\":" + value), NOW);
+        assertTrue(result.valid.isEmpty());
+        assertEquals(2, result.errors.size());
+        JsonNode error = new ObjectMapper().readTree(result.errors.get(0));
+        assertEquals("UpdatedDate", error.path("error_field").asText());
+        assertEquals("INVALID_FIELD", error.path("error_code").asText());
+    }
+
+    @Test void validUpdatedDateDoesNotReplaceCreatedDateForOrdering() {
+        String updated = "2026/1/22 0:00:00.123";
+        HeartbeatSplitter.Result result = splitter.split(message(NOW,
+                "\"EId1\":11,\"UpdatedDate\":\"" + updated + "\""), NOW);
+        assertTrue(result.errors.isEmpty());
+        assertEquals(NOW, result.valid.get(0).createdTimeMs);
+        assertEquals(updated, result.valid.get(0).state.updatedDate);
+    }
 }

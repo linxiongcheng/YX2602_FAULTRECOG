@@ -31,17 +31,25 @@ public final class HeartbeatTime {
     }
 
     public static long parseCreatedDate(String value) {
-        if (value == null) throw new IllegalArgumentException("缺少CreatedDate");
+        return parseDate(value, "CreatedDate");
+    }
+
+    static long parseUpdatedDate(String value) {
+        return parseDate(value, "UpdatedDate");
+    }
+
+    private static long parseDate(String value, String field) {
+        if (value == null) throw new IllegalArgumentException("缺少" + field);
         String text = value.trim();
         if (!text.matches("[0-9]{4}/[0-9]{1,2}/[0-9]{1,2} [0-9]{1,2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?")) {
-            throw new IllegalArgumentException("CreatedDate格式须为yyyy/M/d H:mm:ss，可选1～3位毫秒小数");
+            throw new IllegalArgumentException(field + "格式须为yyyy/M/d H:mm:ss，可选1～3位毫秒小数");
         }
         // 严格校验真实日期，并拒绝历史时区变更导致的不存在时间或歧义时间。
         LocalDateTime local = LocalDateTime.parse(text, FORMAT);
         List<ZoneOffset> offsets = ZONE.getRules().getValidOffsets(local);
-        if (offsets.size() != 1) throw new IllegalArgumentException("CreatedDate处于北京时间历史时区跳变或歧义区间");
+        if (offsets.size() != 1) throw new IllegalArgumentException(field + "处于北京时间历史时区跳变或歧义区间");
         long millis = local.toInstant(offsets.get(0)).toEpochMilli();
-        if (millis <= 0) throw new IllegalArgumentException("CreatedDate须晚于Unix纪元");
+        if (millis <= 0) throw new IllegalArgumentException(field + "须晚于Unix纪元");
         return millis;
     }
 

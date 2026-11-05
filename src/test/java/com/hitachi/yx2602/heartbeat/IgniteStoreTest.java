@@ -74,10 +74,10 @@ class IgniteStoreTest {
 
     @AfterAll static void stopServer() { if (server != null) server.close(); }
 
-    private static List<List<?>> query(String sql) {
+    private static List<List<?>> query(String sql, Object... args) {
         // A dedicated small cache is used solely to issue DDL/SQL through the public server API.
         try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = server.getOrCreateCache("test-sql")
-                .query(new SqlFieldsQuery(sql).setSchema("PUBLIC"))) {
+                .query(new SqlFieldsQuery(sql).setSchema("PUBLIC").setArgs(args))) {
             return cursor.getAll();
         }
     }
@@ -317,6 +317,8 @@ class IgniteStoreTest {
             assertEquals(1, store.write(rows(update)));
         }
         String columns = String.join(",", expected.keySet());
+        expected.put("CreatedDate", new java.sql.Timestamp(createdTime));
+        expected.put("UpdatedDate", new java.sql.Timestamp(HeartbeatTime.parseUpdatedDate("2026/1/23 0:00:08")));
         String mixedCaseSql = "SELECT " + columns + " FROM HB_STATE WHERE EId=773282 ORDER BY SLOT";
         List<List<?>> expectedRows = Arrays.asList(new ArrayList<>(expected.values()), new ArrayList<>(expected.values()));
         // All 41 fields must be readable without quotes in mixed, lower and upper case.
@@ -501,6 +503,79 @@ class IgniteStoreTest {
             assertEquals(6L, query("SELECT MIN(CREATED_TIME_MS) FROM HB_STATE WHERE SLOT>=0 AND eid=99").get(0).get(0));
             assertEquals(15L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE SLOT=-1 AND eid=99").get(0).get(0));
         }
+    }
+
+    @Test void sqlTimestampsKeepMillisNullsAndUseCreatedDateRangeIndex() throws Exception {
+        long created = java.time.Instant.parse("2026-11-04T16:00:00.123Z").toEpochMilli();
+        long updated = java.time.Instant.parse("2026-11-04T15:59:59.456Z").toEpochMilli();
+        ElevatorUpdate first = update(700, created, 1);
+        first.state.createdDate = "2026/11/5 0:00:00.123";
+        first.state.updatedDate = "2026/11/4 23:59:59.456";
+        IgniteHeartbeatStore.Row copied;
+        java.util.TimeZone original = java.util.TimeZone.getDefault();
+        try {
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("America/New_York"));
+            copied = IgniteHeartbeatStore.Row.copyOf(first);
+        } finally { java.util.TimeZone.setDefault(original); }
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+            store.write(Arrays.asList(copied, IgniteHeartbeatStore.Row.copyOf(update(701, created + 1000, 1))));
+        }
+        List<?> stored = query("SELECT CREATEDDATE, UPDATEDDATE, CREATED_TIME_MS, PART_DAY FROM HB_STATE WHERE EID=700 AND SLOT=-1").get(0);
+        assertEquals(java.sql.Timestamp.class, stored.get(0).getClass());
+        assertEquals(created, ((java.sql.Timestamp) stored.get(0)).getTime());
+        assertEquals(updated, ((java.sql.Timestamp) stored.get(1)).getTime());
+        assertEquals(created, stored.get(2));
+        assertEquals("2026-11-05", stored.get(3));
+        assertNull(query("SELECT UPDATEDDATE FROM HB_STATE WHERE EID=701 AND SLOT=-1").get(0).get(0));
+        java.sql.Timestamp start = new java.sql.Timestamp(created), end = new java.sql.Timestamp(created + 1000);
+        assertEquals(Collections.singletonList(Collections.singletonList(700L)),
+                query("SELECT EID FROM HB_STATE WHERE SLOT=-1 AND CREATEDDATE>=? AND CREATEDDATE<? ORDER BY CREATEDDATE", start, end));
+        String plan = query("EXPLAIN SELECT EID FROM HB_STATE WHERE CREATEDDATE>=? AND CREATEDDATE<?", start, end).toString();
+        assertTrue(plan.contains(IgniteHeartbeatStore.Schema.CREATED_DATE_INDEX), plan);
+    }
+
+    @Test void startupRecreatesMissingIndexButReadOnlyCheckDoesNot() {
+        query("DROP INDEX PUBLIC.IDX_HB_STATE_CREATEDDATE");
+        try {
+            assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings, false));
+        } finally {
+            try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings)) { }
+        }
+        try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings, false)) { }
+    }
+
+    @Test void incorrectNamedIndexIsRejectedWithoutBeingSilentlyReplaced() {
+        query("DROP INDEX PUBLIC.IDX_HB_STATE_CREATEDDATE");
+        query("CREATE INDEX IDX_HB_STATE_CREATEDDATE ON PUBLIC.HB_STATE(UPDATEDDATE)");
+        try {
+            assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings));
+            assertTrue(query("SELECT COLUMNS FROM SYS.INDEXES WHERE INDEX_NAME='IDX_HB_STATE_CREATEDDATE'")
+                    .toString().contains("UPDATEDDATE"));
+        } finally {
+            query("DROP INDEX PUBLIC.IDX_HB_STATE_CREATEDDATE");
+            try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings)) { }
+        }
+    }
+
+    @Test void oldStringSchemaIsRejectedAndRecreationUsesANewBinaryValueType() throws Exception {
+        String ddl = Files.readString(java.nio.file.Paths.get("sql/ignite2-heartbeat.sql"))
+                .replaceAll("(?m)^--.*$", "").split(";")[0]
+                .replace("HeartbeatStateRowV3", "HeartbeatStateRowV2")
+                .replace("CREATEDDATE TIMESTAMP", "CREATEDDATE VARCHAR")
+                .replace("UPDATEDDATE TIMESTAMP", "UPDATEDDATE VARCHAR");
+        query("DROP TABLE PUBLIC.HB_STATE");
+        try {
+            query(ddl);
+            query("INSERT INTO HB_STATE(EID,SLOT,CREATEDDATE,UPDATEDDATE) VALUES(800,-1,'old','old')");
+            assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings));
+            assertEquals("old", query("SELECT CREATEDDATE FROM HB_STATE WHERE EID=800").get(0).get(0));
+        } finally {
+            query("DROP TABLE PUBLIC.HB_STATE");
+            try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+                store.write(rows(update(800, 1234, 1)));
+            }
+        }
+        assertEquals(new java.sql.Timestamp(1234), query("SELECT CREATEDDATE FROM HB_STATE WHERE EID=800 AND SLOT=-1").get(0).get(0));
     }
 
     @Test void readOnlyCheckDoesNotCreateMissingTableAndConcurrentWritersCanCreateIt() throws Exception {

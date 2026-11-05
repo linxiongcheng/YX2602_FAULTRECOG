@@ -125,7 +125,7 @@ public final class HeartbeatSplitter {
                 state.mainFaultCode = code(root.get("MainFaultCode" + port), "MainFaultCode" + port);
                 state.subFaultCode = code(root.get("SubFaultCode" + port), "SubFaultCode" + port);
                 state.createdDate = text(root.get("CreatedDate"), "CreatedDate");
-                state.updatedDate = text(root.get("UpdatedDate"), "UpdatedDate");
+                state.updatedDate = updatedDate(root.get("UpdatedDate"));
                 result.valid.add(ElevatorUpdate.from(message, port, id, state));
             } catch (FieldError e) {
                 result.errors.add(error(message, port, id, "INVALID_FIELD", e.field, e.getMessage(), nowMs));
@@ -170,6 +170,16 @@ public final class HeartbeatSplitter {
         if (node == null || node.isNull()) return null;
         if (node.isTextual()) return node.textValue();
         throw new FieldError(field, "必须为字符串");
+    }
+
+    private static String updatedDate(JsonNode node) throws FieldError {
+        if (HeartbeatTime.missing(node)) return null;
+        String value = text(node, "UpdatedDate");
+        try { HeartbeatTime.parseUpdatedDate(value); }
+        catch (java.time.DateTimeException | IllegalArgumentException error) {
+            throw new FieldError("UpdatedDate", "必须为有效北京时间yyyy/M/d H:mm:ss，可选1～3位毫秒小数");
+        }
+        return value;
     }
 
     private String error(HeartbeatMessage message, int port, Long id, String code,

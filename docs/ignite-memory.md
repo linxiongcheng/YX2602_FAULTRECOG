@@ -2,6 +2,43 @@
 
 2026-11-05确认：心跳只保存最新状态和最近N条有效更新，不要求Ignite全停后的数据恢复，不从Kafka历史重建窗口。全停后电梯随新心跳重新出现；离线电梯保持无数据。默认N=10，每梯最多11行（最新状态1行、历史最多10行）。
 
+当前CreatedDate、UpdatedDate为TIMESTAMP，值类型为HeartbeatStateRowV3，并自动创建 `IDX_HB_STATE_CREATEDDATE`。旧VARCHAR表即使已经位于内存区域也需要按下面流程重建。时区、非法日期处理和查询示例见 [时间类型与索引](heartbeat-time.md#createddate索引与时间范围查询)。
+
+## 已核对的容器配置位置
+
+2026-11-05根据 `AI-slave06` 上的现场命令截图确认：
+
+| 项目 | 已核对的信息 |
+| --- | --- |
+| 容器ID | `675e6559ebcf`，容器重建后需重新确认 |
+| IGNITE_HOME | `/opt/ignite/apache-ignite` |
+| 容器内默认配置文件 | `/opt/ignite/apache-ignite/config/default-config.xml`，已确认存在 |
+| Docker WorkingDir | `/opt/ignite`，不能用它直接推导XML位置 |
+| Docker启动命令 | `/bin/sh -c "$IGNITE_HOME/run.sh"` |
+| 数据目录挂载 | `/home/workdir/ignite2/standalone/ignite-data -> /opt/ignite/work` |
+| 配置文件挂载 | 当前Mounts输出未显示配置文件或配置目录挂载 |
+| CONFIG_URI | 本次环境变量查询未显示该变量 |
+
+`/opt/ignite/config/default-config.xml` 已确认不存在。宿主机历史候选路径 `/home/lwh/apache_ignite/ignite-2.18.0/config/default-config.xml` 未证实与该容器关联，不应直接当作当前配置修改目标。
+
+在宿主机执行下面的一行命令查看默认XML：
+
+```bash
+docker exec 675e6559ebcf cat /opt/ignite/apache-ignite/config/default-config.xml
+```
+
+需要确认启动脚本如何选择配置时执行：
+
+```bash
+docker exec 675e6559ebcf cat /opt/ignite/apache-ignite/run.sh
+```
+
+同日后续XML截图已确认文件中的配置：`workDirectory=/opt/ignite/work`，`walMode=FSYNC`；`dataRegionConfigurations` 列表中只有旧 `heartbeat` 区域，`persistenceEnabled=true`，`initialSize=67108864`（64MiB），`maxSize=268435456`（256MiB）。该文件尚未添加 `heartbeat_memory`，尚未完成内存模式切换。这些是文件内容核对结果，启动脚本选择及运行节点是否加载了最新文件仍需由管理员确认。
+
+应在现有列表中、旧 `heartbeat` 的 `</bean>` 之后与 `</list>` 之前追加下节的 `heartbeat_memory` 配置，保留旧区域与全局 `walMode=FSYNC`。新内存区域不因全局保留FSYNC就启用数据持久化。
+
+该XML当前没有单独挂载，修改前由管理员备份；同一容器重启通常保留容器文件，删除重建容器则不能依赖这些修改，长期配置应纳入宿主机挂载或镜像部署管理。
+
 ## 服务管理员需要配置的内容
 
 本项目只连接已有Ignite 2.18.0服务，不启动或重启服务。请管理员在**实际加载的服务端配置**中，为所有承载心跳缓存的节点增加名为 `heartbeat_memory` 的DataRegion。下面是应合并到现有 `DataStorageConfiguration.dataRegionConfigurations` 列表中的配置片段，不是整份启动配置；不要覆盖其他区域或其他业务的持久化设置。
@@ -74,6 +111,8 @@ SELECT EID, CREATEDDATE, DB_SEQUENCE FROM PUBLIC.HB_STATE WHERE SLOT=-1 LIMIT 20
 之前核实的 `/home/workdir/ignite2/standalone/ignite-data/db` 是旧持久化方案的目录记录。新内存窗口不以该目录中的旧分区文件恢复；旧目录由服务管理员管理，不作为本次上线的清理对象。
 
 ## 本地验证与产物
+
+2026-11-05 TIMESTAMP及CreatedDate索引版通过Java 11全量 `mvn -o -B -ntp clean verify`：191项测试全部通过。新增真实SQL时间类型/毫秒/空值读写、跨客户端默认时区、时间范围与EXPLAIN索引命中、缺失索引补建、错误同名索引拒绝、旧VARCHAR表重建与二进制元数据隔离，以及UpdatedDate非法值分流验证。
 
 2026-11-05以Java 11执行 `mvn -o -B -ntp clean verify`，178项测试通过，失败、错误、跳过均为0。真实Ignite 2.18.0内存节点覆盖事务写入、窗口条数、全停丢失及新心跳重建、已有客户端重连后建空表、多个写入器并发建表、只读检查不创建表、错误区域拒绝，以及最终JAR独立进程使用内嵌SQL建表并读写。保留批量事务回滚、同梯并发和动态条数的测试。
 

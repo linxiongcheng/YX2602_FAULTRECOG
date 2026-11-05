@@ -23,14 +23,16 @@ public final class PackagedIgniteClient {
         ElevatorUpdate update = new ElevatorUpdate();
         update.elevatorId = 123; update.createdTimeMs = 1000; update.sendTimeMs = null; update.historySequence = 99;
         update.state = new ElevatorState(); update.state.mainFaultCode = "0008";
+        update.state.updatedDate = "2026/11/5 0:00:00.123";
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(config)) {
             if (store.write(Collections.singletonList(IgniteHeartbeatStore.Row.copyOf(update))) != 1) throw new AssertionError("first write");
             if (store.write(Collections.singletonList(IgniteHeartbeatStore.Row.copyOf(update))) != 0) throw new AssertionError("replay");
         }
         try (IgniteClient client = Ignition.startClient(new ClientConfiguration().setAddresses(args[0]));
              org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = client.query(new SqlFieldsQuery(
-                     "SELECT DB_SEQUENCE, FLINK_SEQUENCE, mainfaultcode, speed FROM PUBLIC.HB_STATE WHERE SLOT=-1 AND eid=123"))) {
-            if (!java.util.Arrays.asList(1L, 99L, "0008", null).equals(cursor.getAll().get(0))) {
+                     "SELECT DB_SEQUENCE, FLINK_SEQUENCE, mainfaultcode, speed, CREATEDDATE, UPDATEDDATE FROM PUBLIC.HB_STATE WHERE SLOT=-1 AND eid=123"))) {
+            if (!java.util.Arrays.asList(1L, 99L, "0008", null, new java.sql.Timestamp(1000),
+                    java.sql.Timestamp.from(java.time.Instant.parse("2026-11-04T16:00:00.123Z"))).equals(cursor.getAll().get(0))) {
                 throw new AssertionError("packaged SQL mapping");
             }
         }

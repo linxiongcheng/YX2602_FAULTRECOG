@@ -45,7 +45,7 @@
 | SignalRssi | state.signalRssi | 0～31 |
 | NetworkType | state.networkType | 1或2，按现有2G/4G协议定义 |
 | RecordStatus、Status | state.recordStatus、state.status | 有符号32位整数；不补文档中的默认值 |
-| UpdatedDate | state.updatedDate | 原始可空字符串，不参与时间排序 |
+| UpdatedDate | state.updatedDate | 可空北京时间字符串；空白转null，非空按与CreatedDate相同的格式严格校验，不参与排序；入库转换为TIMESTAMP |
 
 未知字段不会导致异常，也不自动扩展单梯输出结构；新增业务字段需显式增加映射与测试。数仓字段 `part_day` 不属于本实时消息合同，本模块不生成数仓分区。
 

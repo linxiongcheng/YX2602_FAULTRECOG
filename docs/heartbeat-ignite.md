@@ -96,12 +96,14 @@ bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
 | IntId / FId / Code | 文档中的终端IntId、自增主键和IMSI码 |
 | Floor / ACD / Direction / RS / DoorLock 等 | 文档中的单梯状态字段，每个字段独立一列 |
 | MainFaultCode / SubFaultCode | 字符串故障码，保留前导零 |
-| CreatedDate / UpdatedDate | 原始日期文本 |
+| CreatedDate / UpdatedDate | TIMESTAMP；按北京时间解释源文本，保留毫秒精度；UpdatedDate可空 |
 | part_day | 按CreatedDate的北京时间日期生成，格式yyyy-MM-dd；普通查询列，不是物理分区配置 |
 
-业务字段使用 `BIGINT` 或 `VARCHAR`，缺失值保持NULL；不补零、不继承旧值。字段与类型的完整清单以SQL脚本为准，`SecDoorCouter`、`TCDOpenDoorRuning` 等名称保留文档既有拼写。文档示例中的空字符串SendTime会保存为NULL，其原始JSON表示保留在SEND_TIME_RAW中，CreatedDate仍然决定新旧、过期和part_day。
+业务字段使用 `BIGINT`、`VARCHAR` 或 `TIMESTAMP`，缺失值保持NULL；不补零、不继承旧值。只有CreatedDate、UpdatedDate改为TIMESTAMP，SendTime和*_MS仍为BIGINT。字段与类型的完整清单以SQL脚本为准，`SecDoorCouter`、`TCDOpenDoorRuning` 等名称保留文档既有拼写。文档示例中的空字符串SendTime会保存为NULL，其原始JSON表示保留在SEND_TIME_RAW中，CreatedDate仍然决定新旧、过期和part_day。
 
-缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat_memory` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV2`。启动检查事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型。正式连接可建缺失空表，只读预检不建表。
+缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat_memory` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV3`。启动检查事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型，并通过SYS.INDEXES核实CreatedDate索引。正式连接可建缺失空表和索引，只读预检不建表或索引。
+
+时间范围查询使用 `IDX_HB_STATE_CREATEDDATE(CREATEDDATE)`，详细SQL、时区和旧VARCHAR表切换方法见 [时间类型与索引](heartbeat-time.md#createddate索引与时间范围查询)。索引会增加写入维护及内存开销，需要与写入吞吐一起验收。
 
 客户端无法仅凭缓存配置证明服务端已关闭持久化。`--check-ignite` 的成功只证明连接、ACTIVE状态和上述结构符合要求；服务管理员须确认 `heartbeat_memory.persistenceEnabled=false`。
 
@@ -136,7 +138,7 @@ bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
 | `PART_DAY` | VARCHAR | 从CreatedDate提取的北京时间日期，格式 `yyyy-MM-dd`，方便按日期筛选；是普通查询列，不会自动按天分区、建表或删除数据。 |
 | `SEND_TIME_RAW` | VARCHAR | 原始SendTime字段值的JSON表示，保留其原始类型与内容以便排查格式问题；不是整条原始心跳JSON，也不参与新旧或过期判断。 |
 
-例如 `CREATEDDATE='2026/11/4 10:30:00'` 时，`PART_DAY='2026-11-04'`，`CREATED_TIME_MS`是同一北京时间对应的毫秒时间戳。业务时间始终以CreatedDate为准，不以SendTime或Kafka时间替代。
+例如源数据 `CreatedDate="2026/11/4 10:30:00"` 入库为TIMESTAMP，在北京时间SQL客户端显示为 `2026-11-04 10:30:00`；`PART_DAY='2026-11-04'`，`CREATED_TIME_MS`是同一时刻对应的毫秒时间戳。业务时间始终以CreatedDate为准，不以SendTime或Kafka时间替代。
 
 #### 处理过程追踪（5个字段）
 
@@ -529,7 +531,13 @@ yarn logs -applicationId "$FLINK_APP_ID" \
 
 宿主机直接访问 `/opt/ignite/work/db` 曾提示不存在，这是容器内路径与宿主机路径不同所致。宿主机运维应使用 `/home/workdir/ignite2/standalone/ignite-data`。
 
-启动参数中的配置名称为 `config/default-config.xml`；宿主机曾搜索到 `/home/lwh/apache_ignite/ignite-2.18.0/config/default-config.xml`，但尚未证实它就是运行进程加载的配置。WAL、WAL归档的实际目录及 `heartbeat` 区域的服务端配置内容仍未核实，不将默认目录或历史模板当作现场配置。已打开的数据文件及挂载信息确认的是本节点当前的数据落盘位置，不替代重启恢复验证。
+2026-11-05补充核对容器配置位置：容器ID为 `675e6559ebcf`，`IGNITE_HOME=/opt/ignite/apache-ignite`，Docker WorkingDir为 `/opt/ignite`，启动命令为 `/bin/sh -c "$IGNITE_HOME/run.sh"`。容器内实际找到的默认配置文件是 **`/opt/ignite/apache-ignite/config/default-config.xml`**；`/opt/ignite/config/default-config.xml` 已由现场命令确认不存在，不能根据WorkingDir推导配置路径。
+
+本次Docker挂载输出只有 `/home/workdir/ignite2/standalone/ignite-data -> /opt/ignite/work`，配置文件及其父目录没有单独挂载到宿主机。因此，宿主机曾找到的 `/home/lwh/apache_ignite/ignite-2.18.0/config/default-config.xml` 不作为本容器已确认的配置修改目标。环境变量查询仅返回IGNITE_HOME，没有显示CONFIG_URI。
+
+同日后续XML截图已确认文件内容：`workDirectory=/opt/ignite/work`、`walMode=FSYNC`；列表中旧 `heartbeat` 区域为 `persistenceEnabled=true`，初始内存64MiB（67108864字节），上限256MiB（268435456字节）。文件尚无 `heartbeat_memory` 区域，内存模式配置尚未完成。下一步是在现有列表中追加新内存区域，保留旧区域和全局WAL设置。启动脚本选择、运行节点加载的配置以及WAL/归档实际目录仍待核实。
+
+查看命令及配置插入位置见 [已核对的容器配置位置](ignite-memory.md#已核对的容器配置位置)。容器内配置修改能保留到同一容器重启，但不能保证容器删除重建后仍保留；长期配置应由管理员纳入宿主机挂载或镜像部署管理。
 
 ### 下次直接查看
 

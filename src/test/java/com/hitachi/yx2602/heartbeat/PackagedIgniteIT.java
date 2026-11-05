@@ -74,6 +74,7 @@ class PackagedIgniteIT {
                     + File.pathSeparator + Paths.get("target/test-classes").toAbsolutePath();
             Path log = Paths.get("target/packaged-ignite-smoke.log");
             Process process = new ProcessBuilder(java,
+                    "-Duser.timezone=UTC",
                     "--add-opens=java.base/java.nio=ALL-UNNAMED", "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
                     "--add-opens=java.base/java.lang=ALL-UNNAMED", "--add-opens=java.base/java.util=ALL-UNNAMED",
                     "--add-opens=java.base/java.io=ALL-UNNAMED", "-cp", classpath,

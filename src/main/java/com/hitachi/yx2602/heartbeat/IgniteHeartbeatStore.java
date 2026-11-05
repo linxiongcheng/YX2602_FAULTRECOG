@@ -252,7 +252,8 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     static final class Schema {
         static final String CACHE = "HB_STATE", REGION = "heartbeat_memory";
         static final int LATEST_SLOT = -1;
-        static final String VALUE_TYPE = "HeartbeatStateRowV2", KEY_TYPE = "HeartbeatStateKeyV2";
+        static final String VALUE_TYPE = "HeartbeatStateRowV3", KEY_TYPE = "HeartbeatStateKeyV2";
+        static final String CREATED_DATE_INDEX = "IDX_HB_STATE_CREATEDDATE";
         static final Map<String, Field> STATE_FIELDS;
         static final Map<String, Class<?>> VALUE_FIELDS;
 
@@ -293,36 +294,63 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             valueFields.put("HISTORY_POLICY_VERSION", Long.class);
             valueFields.put("STORED_AT_MS", Long.class);
             stateFields.forEach((column, field) -> valueFields.put(column, field.getType()));
+            valueFields.put("CREATEDDATE", java.sql.Timestamp.class);
+            valueFields.put("UPDATEDDATE", java.sql.Timestamp.class);
             VALUE_FIELDS = Collections.unmodifiableMap(valueFields);
         }
 
         /** Cold starts create an empty table only; existing tables are never dropped or altered. */
         static void ensure(IgniteClient client) {
+            String[] statements = readDdl().split(";");
             if (!client.cacheNames().contains(CACHE)) {
-                String ddl;
-                try (java.io.InputStream input = Schema.class.getResourceAsStream("/sql/ignite2-heartbeat.sql")) {
-                    if (input == null) throw new IllegalStateException("JAR缺少sql/ignite2-heartbeat.sql");
-                    ddl = new String(input.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)
-                            .replaceAll("(?m)^--.*$", "").trim();
-                } catch (java.io.IOException error) {
-                    throw new IllegalStateException("无法读取内存表建表脚本", error);
-                }
                 // IF NOT EXISTS handles simultaneous starts of multiple Sink clients.
-                try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor =
-                             client.query(new SqlFieldsQuery(ddl).setSchema("PUBLIC"))) {
-                    cursor.getAll();
-                }
+                executeDdl(client, statements[0]);
+            }
+            // Reject old VARCHAR schemas before creating any indexes on an existing table.
+            validateTable(client.cache(CACHE).getConfiguration());
+            for (int i = 1; i < statements.length; i++) {
+                if (!statements[i].trim().isEmpty()) executeDdl(client, statements[i]);
             }
             validate(client);
+        }
+
+        private static String readDdl() {
+            try (java.io.InputStream input = Schema.class.getResourceAsStream("/sql/ignite2-heartbeat.sql")) {
+                if (input == null) throw new IllegalStateException("JAR缺少sql/ignite2-heartbeat.sql");
+                return new String(input.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)
+                        .replaceAll("(?m)^--.*$", "").trim();
+            } catch (java.io.IOException error) {
+                throw new IllegalStateException("无法读取内存表建表脚本", error);
+            }
+        }
+
+        private static void executeDdl(IgniteClient client, String statement) {
+            try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor =
+                         client.query(new SqlFieldsQuery(statement).setSchema("PUBLIC"))) {
+                cursor.getAll();
+            }
         }
 
         static void validate(IgniteClient client) {
             Set<String> caches = new HashSet<>(client.cacheNames());
             if (!caches.contains(CACHE)) throw new IllegalStateException("缺少缓存" + CACHE + "，请先执行sql/ignite2-heartbeat.sql");
             validate(client.cache(CACHE).getConfiguration());
+            // Dynamic SQL indexes are not included in thin-client cache configuration snapshots.
+            try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = client.query(new SqlFieldsQuery(
+                    "SELECT INDEX_TYPE, COLUMNS FROM SYS.INDEXES WHERE CACHE_NAME=? AND INDEX_NAME=?")
+                    .setArgs(CACHE, CREATED_DATE_INDEX))) {
+                List<List<?>> indexes = cursor.getAll();
+                require(indexes.size() == 1 && "SORTED".equals(indexes.get(0).get(0))
+                                && "\"CREATEDDATE\" ASC".equals(String.valueOf(indexes.get(0).get(1)).split(",", 2)[0].trim()),
+                        CACHE, "索引" + CREATED_DATE_INDEX + "须以CREATEDDATE ASC为首列");
+            }
         }
 
         static void validate(ClientCacheConfiguration config) {
+            validateTable(config);
+        }
+
+        private static void validateTable(ClientCacheConfiguration config) {
             String name = CACHE;
             require(CACHE.equals(config.getName()), name, "缓存名");
             require(config.getAtomicityMode() == CacheAtomicityMode.TRANSACTIONAL, name, "ATOMICITY=TRANSACTIONAL");
@@ -389,6 +417,11 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
                 try { fields.put(entry.getKey(), entry.getValue().get(update.state)); }
                 catch (IllegalAccessException e) { throw new IllegalStateException(e); }
             }
+            // Timestamp takes an absolute epoch value; conversion never uses the client's default timezone.
+            fields.put("CREATEDDATE", new java.sql.Timestamp(createdTimeMs));
+            String updated = update.state.updatedDate;
+            fields.put("UPDATEDDATE", updated == null || updated.trim().isEmpty() ? null
+                    : new java.sql.Timestamp(HeartbeatTime.parseUpdatedDate(updated)));
             values = java.util.Collections.unmodifiableMap(fields);
         }
 
