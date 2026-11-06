@@ -29,7 +29,7 @@
 
 按新项目设计，不实现旧SendTime版本状态迁移。Flink状态类为 `CreatedVersion`，状态名为 `last-accepted-created-version-v1`，每梯序号从1开始。后续本项目的检查点/保存点可以恢复CreatedDate基准和序号。
 
-数据库使用 [建表脚本](../sql/ignite2-heartbeat.sql) 中的单表 `PUBLIC.HB_STATE`，每梯SLOT=-1保存最新状态，SLOT>=0保存默认最多10条历史；保留条数支持热更新，调小后在该梯下一条新心跳被接受时事务内清理，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。`CREATED_TIME_MS` 是比较依据；`CREATEDDATE`、`UPDATEDDATE` 为TIMESTAMP，Java写入类型为java.sql.Timestamp，保留毫秒精度。`part_day` 是按北京时间生成的yyyy-MM-dd日期。`sendtime`、`*_MS`仍为BIGINT；`SEND_TIME_RAW`仅用于追踪。数据库独立维护DB_SEQUENCE，不使用Flink序号决定历史槽位。
+数据库使用 [建表脚本](../sql/ignite2-heartbeat.sql) 中的单表 `PUBLIC.HB_STATE`，每梯SLOT=-1保存最新状态，SLOT>=0保存默认最多10条历史；保留条数支持热更新，调小后在该梯下一条新心跳被接受时事务内清理，详见 [存储模块说明](heartbeat-ignite.md#历史条数热更新)。`CREATED_TIME_MS` 是比较依据；`CREATEDDATE`、`UPDATEDDATE`、`SENDTIME` 为TIMESTAMP，Java写入类型为java.sql.Timestamp，保留毫秒精度。`part_day` 是按北京时间生成的yyyy-MM-dd日期。`*_MS`仍为BIGINT；`SEND_TIME_RAW`仅用于追踪。数据库独立维护DB_SEQUENCE，不使用Flink序号决定历史槽位。
 
 UpdatedDate采用与CreatedDate相同的北京时间格式，但不参与排序、过期或未来时间判断，也不要求晚于CreatedDate。空白归一为NULL；非空非法值在解析阶段进入异常Topic，避免进入写入队列后使整个批次失败。
 
@@ -67,13 +67,23 @@ WHERE CREATEDDATE >= TIMESTAMP '2026-11-05 16:00:00'
 
 查询历史将 `SLOT=-1` 改为 `SLOT>=0`，避免最新状态与历史重复计数。时间范围条件直接作用于CREATEDDATE，避免先对该列格式化或CAST为字符串。实际查询是否选择索引以EXPLAIN为准；小表或低选择性范围也可能选择其他计划。索引覆盖最新与历史两种槽位，会增加内存和每次写入的维护开销，不是写入加速措施。
 
-## 从旧VARCHAR表切换
+## 从旧字段类型切换
 
-本次按无旧数据部署：停止旧心跳作业，由管理员DROP旧HB_STATE，替换JAR及SQL，再按 [内存模式](ignite-memory.md) 使用新消费组且不带Savepoint启动，自动建TIMESTAMP表及索引。不要仅执行CREATE TABLE IF NOT EXISTS，它不会把已有VARCHAR列改成TIMESTAMP。无需更改local.properties中的字段类型配置。
+本次按无旧数据部署：停止旧心跳作业，由管理员DROP旧HB_STATE，替换JAR及SQL，再按 [内存模式](ignite-memory.md) 使用新消费组且不带Savepoint启动，自动建TIMESTAMP表及索引。不要仅执行CREATE TABLE IF NOT EXISTS，它不会把已有VARCHAR日期列或BIGINT的SENDTIME列改成TIMESTAMP。无需更改local.properties中的字段类型配置。
 
-值类型升级为 `HeartbeatStateRowV3`，避免Ignite保留的旧二进制元数据仍把两个日期字段识别为String；键类型继续为 `HeartbeatStateKeyV2`。旧表会被启动校验拒绝，不迁移旧值，不清理共享集群的全局元数据。
+值类型升级为 `HeartbeatStateRowV4`，避免Ignite保留的旧二进制元数据仍把日期字段识别为String或把SENDTIME识别为Long；键类型继续为 `HeartbeatStateKeyV2`。旧表会被启动校验拒绝，不迁移旧值，不清理共享集群的全局元数据。
+
+## SendTime时间类型（2026-11-06）
+
+SQL中的 `SENDTIME` 改为可空TIMESTAMP。输入仍按原协议读取正64位整数的Unix毫秒值；存储时直接使用 `new java.sql.Timestamp(sendTimeMs)`，保留毫秒精度，不乘1000，也不加减8小时。缺失或不符合既有解析规则的SendTime继续存NULL，`SEND_TIME_RAW` 保留原字段的JSON表示。内部 `sendTimeMs`、预览输出和所有 `*_MS` 字段保持原有毫秒含义。
+
+只有CreatedDate用于新旧判断、过期过滤和历史窗口排序。SendTime仍仅供追踪，不新增SendTime索引，现有CreatedDate索引保留。SQL显示时区仍按上面的客户端/服务端时区说明配置。
+
+本次值类型从V3升级为V4。原表的SENDTIME是BIGINT，不能直接沿用。停止所有旧心跳作业，由管理员执行 `DROP TABLE IF EXISTS PUBLIC.HB_STATE;`，更新JAR和SQL后启动新版，自动创建新表及索引。此操作清空现有窗口，新心跳重新积累；不需要为字段类型变更重启整个Ignite或修改20GiB内存上限。缺表自动创建不等于自动修改已有字段类型。
 
 ## 验证结果
+
+2026-11-06 SENDTIME类型版本在Java 11下执行 `mvn -o -B -ntp clean verify`，194项测试通过，无失败、错误或跳过。覆盖三个端口到SQL的字段类型、最新及历史槽位的SENDTIME时间值与毫秒精度、NULL与CreatedDate排序独立性、跨默认时区写入、旧V3/BIGINT表拒绝与重建，以及独立UTC客户端运行最终JAR。
 
 2026-11-05 TIMESTAMP及索引版本在Java 11下执行 `mvn -o -B -ntp clean verify`，191项测试通过，失败/错误/跳过均为0。真实Ignite验证Timestamp类型、毫秒精度、UpdatedDate空值和非法值分流、跨JVM默认时区读写、范围边界及EXPLAIN使用索引、缺失索引补建、旧String二进制元数据与新值类型隔离；最终JAR使用UTC客户端独立进程验收。
 

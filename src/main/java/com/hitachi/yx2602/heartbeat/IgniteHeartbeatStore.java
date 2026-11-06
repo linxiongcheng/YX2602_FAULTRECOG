@@ -252,7 +252,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
     static final class Schema {
         static final String CACHE = "HB_STATE", REGION = "heartbeat_memory";
         static final int LATEST_SLOT = -1;
-        static final String VALUE_TYPE = "HeartbeatStateRowV3", KEY_TYPE = "HeartbeatStateKeyV2";
+        static final String VALUE_TYPE = "HeartbeatStateRowV4", KEY_TYPE = "HeartbeatStateKeyV2";
         static final String CREATED_DATE_INDEX = "IDX_HB_STATE_CREATEDDATE";
         static final Map<String, Field> STATE_FIELDS;
         static final Map<String, Class<?>> VALUE_FIELDS;
@@ -278,7 +278,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             STATE_FIELDS = Collections.unmodifiableMap(stateFields);
             Map<String, Class<?>> valueFields = new LinkedHashMap<>();
             valueFields.put("PORT", Integer.class);
-            valueFields.put("SENDTIME", Long.class);
+            valueFields.put("SENDTIME", java.sql.Timestamp.class);
             valueFields.put("PART_DAY", String.class);
             valueFields.put("SEND_TIME_RAW", String.class);
             valueFields.put("CREATED_TIME_MS", Long.class);
@@ -401,7 +401,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             createdTimeMs = update.createdTimeMs;
             Map<String, Object> fields = new LinkedHashMap<>();
             fields.put("PORT", update.port);
-            fields.put("SENDTIME", update.sendTimeMs);
+            fields.put("SENDTIME", update.sendTimeMs == null ? null : new java.sql.Timestamp(update.sendTimeMs));
             fields.put("PART_DAY", Instant.ofEpochMilli(createdTimeMs)
                     .atZone(ZoneId.of("Asia/Shanghai")).toLocalDate().toString());
             fields.put("SEND_TIME_RAW", update.sendTimeRaw);

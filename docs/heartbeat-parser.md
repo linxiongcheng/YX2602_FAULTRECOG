@@ -26,7 +26,7 @@
 | --- | --- | --- |
 | EIdn | elevatorId | 正64位整数；0表示空端口 |
 | CreatedDate | createdTimeMs、state.createdDate | 必填北京时间字符串，严格解析为Unix毫秒并核对读取结果；保留原始日期文本 |
-| SendTime | sendTimeMs、sendTimeRaw | 可选来源元数据；正64位整数保留为sendTimeMs，其他情况为null；sendTimeRaw保留字段值的JSON表示 |
+| SendTime | sendTimeMs、sendTimeRaw | 可选来源元数据；正64位整数保留为sendTimeMs，其他情况为null；sendTimeRaw保留字段值的JSON表示；入库时SENDTIME转换为TIMESTAMP |
 | IntId、FId | state.intId、state.fId | 非负64位整数 |
 | Code | state.code | 非空字符串原样保留；非负64位整数转字符串 |
 | Floorn | state.floor | 有符号32位整数，支持负楼层 |

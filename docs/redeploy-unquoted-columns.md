@@ -4,7 +4,7 @@
 
 适用于本次不保留旧数据、不恢复旧Flink状态的部署。表仍为 `PUBLIC.HB_STATE`，字段采用不带双引号的SQL标识符。Ignite保存为大写，查询可以直接使用 `eid`、`EId` 或 `EID`。原始Kafka JSON字段名和解析规则不变。
 
-建表脚本、Java缓存字段映射和启动结构校验已经同步更新。当前二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV3`，值类型V3使用TIMESTAMP日期，避免复用旧String类型元数据。必须同时更新JAR和SQL，旧JAR不能写新表。
+建表脚本、Java缓存字段映射和启动结构校验已经同步更新。当前二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV4`，值类型V4的CreatedDate、UpdatedDate、SendTime均使用TIMESTAMP，避免复用旧String/Long类型元数据。必须同时更新JAR和SQL，旧JAR不能写新表。
 
 ## 1. 停止旧YARN作业
 

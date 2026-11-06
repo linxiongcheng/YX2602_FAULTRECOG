@@ -318,6 +318,7 @@ class IgniteStoreTest {
         }
         String columns = String.join(",", expected.keySet());
         expected.put("CreatedDate", new java.sql.Timestamp(createdTime));
+        expected.put("SendTime", new java.sql.Timestamp(createdTime + 5000));
         expected.put("UpdatedDate", new java.sql.Timestamp(HeartbeatTime.parseUpdatedDate("2026/1/23 0:00:08")));
         String mixedCaseSql = "SELECT " + columns + " FROM HB_STATE WHERE EId=773282 ORDER BY SLOT";
         List<List<?>> expectedRows = Arrays.asList(new ArrayList<>(expected.values()), new ArrayList<>(expected.values()));
@@ -511,6 +512,7 @@ class IgniteStoreTest {
         ElevatorUpdate first = update(700, created, 1);
         first.state.createdDate = "2026/11/5 0:00:00.123";
         first.state.updatedDate = "2026/11/4 23:59:59.456";
+        first.sendTimeMs = created + 789;
         IgniteHeartbeatStore.Row copied;
         java.util.TimeZone original = java.util.TimeZone.getDefault();
         try {
@@ -527,6 +529,10 @@ class IgniteStoreTest {
         assertEquals(created, stored.get(2));
         assertEquals("2026-11-05", stored.get(3));
         assertNull(query("SELECT UPDATEDDATE FROM HB_STATE WHERE EID=701 AND SLOT=-1").get(0).get(0));
+        for (List<?> sent : query("SELECT SENDTIME FROM HB_STATE WHERE EID=700 ORDER BY SLOT")) {
+            assertEquals(java.sql.Timestamp.class, sent.get(0).getClass());
+            assertEquals(created + 789, ((java.sql.Timestamp) sent.get(0)).getTime());
+        }
         java.sql.Timestamp start = new java.sql.Timestamp(created), end = new java.sql.Timestamp(created + 1000);
         assertEquals(Collections.singletonList(Collections.singletonList(700L)),
                 query("SELECT EID FROM HB_STATE WHERE SLOT=-1 AND CREATEDDATE>=? AND CREATEDDATE<? ORDER BY CREATEDDATE", start, end));
@@ -560,7 +566,8 @@ class IgniteStoreTest {
     @Test void oldStringSchemaIsRejectedAndRecreationUsesANewBinaryValueType() throws Exception {
         String ddl = Files.readString(java.nio.file.Paths.get("sql/ignite2-heartbeat.sql"))
                 .replaceAll("(?m)^--.*$", "").split(";")[0]
-                .replace("HeartbeatStateRowV3", "HeartbeatStateRowV2")
+                .replace(IgniteHeartbeatStore.Schema.VALUE_TYPE, "HeartbeatStateRowV2")
+                .replace("SENDTIME TIMESTAMP", "SENDTIME BIGINT")
                 .replace("CREATEDDATE TIMESTAMP", "CREATEDDATE VARCHAR")
                 .replace("UPDATEDDATE TIMESTAMP", "UPDATEDDATE VARCHAR");
         query("DROP TABLE PUBLIC.HB_STATE");
@@ -576,6 +583,26 @@ class IgniteStoreTest {
             }
         }
         assertEquals(new java.sql.Timestamp(1234), query("SELECT CREATEDDATE FROM HB_STATE WHERE EID=800 AND SLOT=-1").get(0).get(0));
+    }
+
+    @Test void oldBigintSendTimeIsRejectedAndRecreationKeepsOldMetadataSeparate() throws Exception {
+        String ddl = Files.readString(java.nio.file.Paths.get("sql/ignite2-heartbeat.sql"))
+                .replaceAll("(?m)^--.*$", "").split(";")[0]
+                .replace(IgniteHeartbeatStore.Schema.VALUE_TYPE, "HeartbeatStateRowV3")
+                .replace("SENDTIME TIMESTAMP", "SENDTIME BIGINT");
+        query("DROP TABLE PUBLIC.HB_STATE");
+        try {
+            query(ddl);
+            query("INSERT INTO HB_STATE(EID,SLOT,SENDTIME) VALUES(801,-1,1234)");
+            assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings));
+            assertEquals(1234L, query("SELECT SENDTIME FROM HB_STATE WHERE EID=801").get(0).get(0));
+        } finally {
+            query("DROP TABLE PUBLIC.HB_STATE");
+            try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+                store.write(rows(update(801, 1234, 1)));
+            }
+        }
+        assertEquals(new java.sql.Timestamp(1234), query("SELECT SENDTIME FROM HB_STATE WHERE EID=801 AND SLOT=-1").get(0).get(0));
     }
 
     @Test void readOnlyCheckDoesNotCreateMissingTableAndConcurrentWritersCanCreateIt() throws Exception {

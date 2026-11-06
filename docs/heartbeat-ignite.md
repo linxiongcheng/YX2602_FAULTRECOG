@@ -83,7 +83,7 @@ bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
 | EId | 文档中的电梯IntId，与SLOT组成主键 |
 | SLOT | -1为最新状态；0～N−1为历史状态；运行元数据 |
 | CREATED_TIME_MS | CreatedDate按Asia/Shanghai转换的UTC Unix毫秒，唯一新旧比较依据 |
-| SendTime | 可选SendTime正整数，沿用既有BIGINT规范化规则，缺失或非法为NULL；不参与时间规则 |
+| SendTime | TIMESTAMP；由可选SendTime正整数Unix毫秒值转换，缺失或非法为NULL；不参与时间规则 |
 | SEND_TIME_RAW | SendTime字段值的JSON表示，仅追踪用途 |
 | DB_SEQUENCE | 数据库成功接受的状态序号 |
 | HISTORY_LIMIT | 写入时采用的历史保留上限；SLOT=-1记录该梯当前已应用上限 |
@@ -99,9 +99,9 @@ bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh \
 | CreatedDate / UpdatedDate | TIMESTAMP；按北京时间解释源文本，保留毫秒精度；UpdatedDate可空 |
 | part_day | 按CreatedDate的北京时间日期生成，格式yyyy-MM-dd；普通查询列，不是物理分区配置 |
 
-业务字段使用 `BIGINT`、`VARCHAR` 或 `TIMESTAMP`，缺失值保持NULL；不补零、不继承旧值。只有CreatedDate、UpdatedDate改为TIMESTAMP，SendTime和*_MS仍为BIGINT。字段与类型的完整清单以SQL脚本为准，`SecDoorCouter`、`TCDOpenDoorRuning` 等名称保留文档既有拼写。文档示例中的空字符串SendTime会保存为NULL，其原始JSON表示保留在SEND_TIME_RAW中，CreatedDate仍然决定新旧、过期和part_day。
+业务字段使用 `BIGINT`、`VARCHAR` 或 `TIMESTAMP`，缺失值保持NULL；不补零、不继承旧值。CreatedDate、UpdatedDate、SendTime为TIMESTAMP，*_MS仍为BIGINT。字段与类型的完整清单以SQL脚本为准，`SecDoorCouter`、`TCDOpenDoorRuning` 等名称保留文档既有拼写。文档示例中的空字符串SendTime会保存为NULL，其原始JSON表示保留在SEND_TIME_RAW中，CreatedDate仍然决定新旧、过期和part_day。
 
-缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat_memory` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV3`。启动检查事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型，并通过SYS.INDEXES核实CreatedDate索引。正式连接可建缺失空表和索引，只读预检不建表或索引。
+缓存名为 `HB_STATE`，类型为 `PARTITIONED + TRANSACTIONAL + FULL_SYNC`，当前脚本 `BACKUPS=0`，使用 `heartbeat_memory` 数据区域。同一EId的最新及历史槽位通过 `AFFINITY_KEY=EID` 放在同一分区。二进制类型为 `HeartbeatStateKeyV2` / `HeartbeatStateRowV4`。启动检查事务模式、同步模式、数据区域名称、无过期策略、表名、字段及大小写、复合主键及二进制类型，并通过SYS.INDEXES核实CreatedDate索引。正式连接可建缺失空表和索引，只读预检不建表或索引。
 
 时间范围查询使用 `IDX_HB_STATE_CREATEDDATE(CREATEDDATE)`，详细SQL、时区和旧VARCHAR表切换方法见 [时间类型与索引](heartbeat-time.md#createddate索引与时间范围查询)。索引会增加写入维护及内存开销，需要与写入吞吐一起验收。
 

@@ -50,7 +50,7 @@ Kafka 原始心跳（bytes，保留来源坐标）
 
 存储使用一张 `HB_STATE` 表：主键为 `(EID, SLOT)`，`SLOT=-1` 是最新状态，`SLOT>=0` 是最近N条历史，每梯最多N+1行。业务列沿用心跳文档中拆分后的41个字段拼写，建表不加字段双引号，Ignite统一保存为大写；查询直接写 `eid`、`floor`、`mainfaultcode`、`createddate` 即可。`part_day` 按CreatedDate的北京时间日期生成。查历史须过滤掉SLOT=-1。完整查询示例见 [存储说明](docs/heartbeat-ignite.md#检查点重试与运维)。
 
-`CREATEDDATE`、`UPDATEDDATE` 使用SQL `TIMESTAMP`，`*_MS`及SendTime保留毫秒整数。正式启动自动创建CreatedDate有序索引；旧VARCHAR表须按无旧数据方案重建，并同时更新JAR。查询SQL、时区与索引说明见 [时间类型与索引](docs/heartbeat-time.md#createddate索引与时间范围查询)。
+`CREATEDDATE`、`UPDATEDDATE`、`SENDTIME` 使用SQL `TIMESTAMP`，`*_MS`保留毫秒整数。SENDTIME从原协议Unix毫秒值直接转换，缺失或非法值保持NULL。正式启动自动创建CreatedDate有序索引；旧VARCHAR日期表或SENDTIME仍为BIGINT的表须按无旧数据方案重建，并同时更新JAR和SQL。查询SQL、时区与索引说明见 [时间类型与索引](docs/heartbeat-time.md#createddate索引与时间范围查询)。
 
 ## 工程结构
 

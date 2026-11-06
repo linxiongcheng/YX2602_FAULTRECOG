@@ -2,7 +2,7 @@
 
 2026-11-05确认：心跳只保存最新状态和最近N条有效更新，不要求Ignite全停后的数据恢复，不从Kafka历史重建窗口。全停后电梯随新心跳重新出现；离线电梯保持无数据。默认N=10，每梯最多11行（最新状态1行、历史最多10行）。
 
-当前CreatedDate、UpdatedDate为TIMESTAMP，值类型为HeartbeatStateRowV3，并自动创建 `IDX_HB_STATE_CREATEDDATE`。旧VARCHAR表即使已经位于内存区域也需要按下面流程重建。时区、非法日期处理和查询示例见 [时间类型与索引](heartbeat-time.md#createddate索引与时间范围查询)。
+当前CreatedDate、UpdatedDate、SendTime为TIMESTAMP，值类型为HeartbeatStateRowV4，并自动创建 `IDX_HB_STATE_CREATEDDATE`。旧VARCHAR日期表或SENDTIME仍为BIGINT的表，即使已经位于内存区域也需要按下面流程重建。时区、非法日期处理和查询示例见 [时间类型与索引](heartbeat-time.md#createddate索引与时间范围查询)。
 
 ## 已核对的容器配置位置
 
