@@ -1,6 +1,6 @@
 # 无引号字段：清空重建与重新部署
 
-本页保留字段结构升级操作。当前版本还要求服务端新增 `heartbeat_memory` 内存区域；首次切换与全停后重建须先按 [内存模式部署说明](ignite-memory.md) 执行，不能只替换JAR或SQL。
+本页保留字段结构升级操作。当前版本使用服务端默认内存区域，不再要求新增 `heartbeat_memory`；首次切换与全停后重建须先按 [内存模式部署说明](ignite-memory.md) 执行，不能只替换JAR或SQL。
 
 适用于本次不保留旧数据、不恢复旧Flink状态的部署。表仍为 `PUBLIC.HB_STATE`，字段采用不带双引号的SQL标识符。Ignite保存为大写，查询可以直接使用 `eid`、`EId` 或 `EID`。原始Kafka JSON字段名和解析规则不变。
 

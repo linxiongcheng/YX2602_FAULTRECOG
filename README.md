@@ -2,7 +2,7 @@
 
 Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式校验、分梯、字段规范化、10分钟过期过滤及按电梯判断新旧，输出带历史序号的单梯状态。读取和解析异常都可靠写入配置的异常Topic。解析规则与字段映射详见 [解析模块说明](docs/heartbeat-parser.md)。正式写入与部署详见 [Ignite 模块说明](docs/heartbeat-ignite.md)。
 
-当前采用 **Ignite纯内存心跳窗口**：服务端配置独立 `heartbeat_memory` 区域且 `persistenceEnabled=false`，全停后丢失的窗口由新心跳重新建立，不回放Kafka历史。正式作业自动创建不存在的空表，既有旧表不会自动迁移或删除。首次切换及后续内存服务重启按 [内存模式部署说明](docs/ignite-memory.md) 执行。
+当前采用 **Ignite纯内存心跳窗口**：使用服务端默认数据区域且 `persistenceEnabled=false`，允许RANDOM_2_LRU淘汰最新及历史记录；丢失窗口由后续有效心跳逐步重新建立，不做历史窗口恢复。正式作业自动创建不存在的空表，既有旧表不会自动迁移或删除。首次切换及后续内存服务重启按 [内存模式部署说明](docs/ignite-memory.md) 执行。
 
 旧表改为查询无需引号的结构，按 [清空重建与重新部署](docs/redeploy-unquoted-columns.md) 执行。
 
@@ -46,7 +46,7 @@ Kafka 原始心跳（bytes，保留来源坐标）
 
 **业务时间只取CreatedDate，时区固定为北京时间（Asia/Shanghai）。** 例如 `2026/1/22 17:56:17` 对应UTC `2026-01-22T09:56:17Z`，不受JVM默认时区影响。缺失、空值或非法日期写异常Topic，不回退到SendTime、Kafka时间或接收时间。同梯CreatedDate相同仍按重复过滤；上游只提供秒精度时，同一秒最多接受一条。平台时钟用于超前与过期判断，需要节点时钟同步。
 
-按新项目首次部署：管理员配置内存区域并处理旧同名表，正式启动自动创建空 `PUBLIC.HB_STATE`，也可手工执行当前建表脚本。不迁移旧数据、不加载旧项目的Checkpoint/Savepoint。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
+按新项目首次部署：管理员核对默认内存区域并处理旧同名表，正式启动自动创建空 `PUBLIC.HB_STATE`，也可手工执行当前建表脚本。不迁移旧数据、不加载旧项目的Checkpoint/Savepoint。时间规则详见 [CreatedDate说明](docs/heartbeat-time.md)。
 
 存储使用一张 `HB_STATE` 表：主键为 `(EID, SLOT)`，`SLOT=-1` 是最新状态，`SLOT>=0` 是最近N条历史，每梯最多N+1行。业务列沿用心跳文档中拆分后的41个字段拼写，建表不加字段双引号，Ignite统一保存为大写；查询直接写 `eid`、`floor`、`mainfaultcode`、`createddate` 即可。`part_day` 按CreatedDate的北京时间日期生成。查历史须过滤掉SLOT=-1。完整查询示例见 [存储说明](docs/heartbeat-ignite.md#检查点重试与运维)。
 

@@ -49,8 +49,10 @@ class IgniteStoreTest {
     }
 
     private static void startServer() {
-        DataRegionConfiguration region = new DataRegionConfiguration().setName(IgniteHeartbeatStore.Schema.REGION)
-                .setPersistenceEnabled(false).setInitialSize(32L << 20).setMaxSize(128L << 20);
+        DataRegionConfiguration region = new DataRegionConfiguration().setName("Memory_Region")
+                .setPersistenceEnabled(false).setInitialSize(32L << 20).setMaxSize(128L << 20)
+                .setPageEvictionMode(org.apache.ignite.configuration.DataPageEvictionMode.RANDOM_2_LRU)
+                .setEvictionThreshold(0.7);
         IgniteConfiguration cfg = new IgniteConfiguration()
                 .setIgniteInstanceName("heartbeat-integration-test").setConsistentId("heartbeat-test-node")
                 .setLocalHost("127.0.0.1").setWorkDirectory(directory.resolve("work").toString())
@@ -489,6 +491,36 @@ class IgniteStoreTest {
         }
     }
 
+    @Test void coldTableUsesCustomNamedDefaultRegionWithPageEviction() {
+        // SYS.CACHES exposes the omitted cache option as NULL, not the resolved default name.
+        assertEquals(Collections.singletonList(Collections.singletonList(null)),
+                query("SELECT DATA_REGION_NAME FROM SYS.CACHES WHERE CACHE_NAME='HB_STATE'"));
+        DataRegionConfiguration region = server.configuration().getDataStorageConfiguration()
+                .getDefaultDataRegionConfiguration();
+        assertFalse(region.isPersistenceEnabled());
+        assertEquals("Memory_Region", region.getName());
+        assertEquals("Memory_Region", ((org.apache.ignite.internal.IgniteEx) server).context().cache()
+                .internalCache("HB_STATE").context().group().dataRegion().config().getName());
+        assertEquals(org.apache.ignite.configuration.DataPageEvictionMode.RANDOM_2_LRU, region.getPageEvictionMode());
+        assertEquals(0.7, region.getEvictionThreshold());
+        assertTrue(server.configuration().getDataStorageConfiguration().getDataRegionConfigurations() == null
+                || server.configuration().getDataStorageConfiguration().getDataRegionConfigurations().length == 0);
+    }
+
+    @Test void partialWindowLossDoesNotPreventNewHeartbeats() throws Exception {
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+            for (int n = 1; n <= 10; n++) store.write(rows(update(999, n, n)));
+            // Deterministic record-loss simulation; this does not predict which pages LRU will evict.
+            query("DELETE FROM HB_STATE WHERE EID=999 AND SLOT IN (-1,3,4)");
+            assertEquals(1, store.write(rows(update(999, 11, 11))));
+            assertEquals(11L, query("SELECT CREATED_TIME_MS FROM HB_STATE WHERE EID=999 AND SLOT=-1").get(0).get(0));
+            assertEquals(1L, query("SELECT DB_SEQUENCE FROM HB_STATE WHERE EID=999 AND SLOT=-1").get(0).get(0));
+            for (int n = 12; n <= 22; n++) store.write(rows(update(999, n, n)));
+            assertEquals(11L, query("SELECT COUNT(*) FROM HB_STATE WHERE EID=999").get(0).get(0));
+            assertEquals(13L, query("SELECT MIN(CREATED_TIME_MS) FROM HB_STATE WHERE EID=999 AND SLOT>=0").get(0).get(0));
+        }
+    }
+
     @Test void memoryRestartLosesWindowAndNewHeartbeatsRebuildItWithExistingClient() throws Exception {
         try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
             store.write(rows(update(99, 1, 1)));
@@ -636,9 +668,8 @@ class IgniteStoreTest {
         config.setAtomicityMode(CacheAtomicityMode.ATOMIC);
         assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
         config.setAtomicityMode(CacheAtomicityMode.TRANSACTIONAL);
-        config.setDataRegionName("heartbeat");
-        assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
-        config.setDataRegionName(IgniteHeartbeatStore.Schema.REGION);
+        config.setDataRegionName("Memory_Region");
+        assertDoesNotThrow(() -> IgniteHeartbeatStore.Schema.validate(config));
         config.getQueryEntities()[0].getFields().remove("SPEED");
         assertThrows(IllegalStateException.class, () -> IgniteHeartbeatStore.Schema.validate(config));
     }

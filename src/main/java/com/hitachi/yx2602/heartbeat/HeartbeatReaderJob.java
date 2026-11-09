@@ -32,7 +32,7 @@ public final class HeartbeatReaderJob {
         if (production || args[2].equals("--check-ignite")) {
             // 先检查数据库连接和表结构，避免检查失败时已经初始化 Kafka 消费位点。
             try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(config.ignite, production)) {
-                System.out.println("Ignite连接与缓存结构校验通过；服务端heartbeat_memory区域须配置persistenceEnabled=false，客户端无法验证该开关。");
+                System.out.println("Ignite连接与缓存结构校验通过；新表使用服务端默认数据区域。纯内存及淘汰策略由服务端配置，客户端不验证；窗口允许因淘汰或重启丢失。");
             }
             if (!production) return;
         }

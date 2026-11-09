@@ -81,6 +81,10 @@ SQL中的 `SENDTIME` 改为可空TIMESTAMP。输入仍按原协议读取正64位
 
 本次值类型从V3升级为V4。原表的SENDTIME是BIGINT，不能直接沿用。停止所有旧心跳作业，由管理员执行 `DROP TABLE IF EXISTS PUBLIC.HB_STATE;`，更新JAR和SQL后启动新版，自动创建新表及索引。此操作清空现有窗口，新心跳重新积累；不需要为字段类型变更重启整个Ignite或修改20GiB内存上限。缺表自动创建不等于自动修改已有字段类型。
 
+## 默认区域与淘汰（2026-11-09）
+
+建表不再指定DATA_REGION，启动校验不限制区域名。允许最新和历史记录因RANDOM_2_LRU淘汰而丢失，DB_SEQUENCE在最新槽位丢失后会重新开始，历史条数不保证完整；查询仍以CreatedDate排序。具体部署及语义见 [默认区域内存模式](ignite-memory.md)。
+
 ## 验证结果
 
 2026-11-06 SENDTIME类型版本在Java 11下执行 `mvn -o -B -ntp clean verify`，194项测试通过，无失败、错误或跳过。覆盖三个端口到SQL的字段类型、最新及历史槽位的SENDTIME时间值与毫秒精度、NULL与CreatedDate排序独立性、跨默认时区写入、旧V3/BIGINT表拒绝与重建，以及独立UTC客户端运行最终JAR。

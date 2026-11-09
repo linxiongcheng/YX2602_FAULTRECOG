@@ -250,7 +250,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
 
     /** 存储结构定义与启动校验：SQL 用于建表和查询，事务写入统一使用 Cache API。 */
     static final class Schema {
-        static final String CACHE = "HB_STATE", REGION = "heartbeat_memory";
+        static final String CACHE = "HB_STATE";
         static final int LATEST_SLOT = -1;
         static final String VALUE_TYPE = "HeartbeatStateRowV4", KEY_TYPE = "HeartbeatStateKeyV2";
         static final String CREATED_DATE_INDEX = "IDX_HB_STATE_CREATEDDATE";
@@ -356,9 +356,6 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             require(config.getAtomicityMode() == CacheAtomicityMode.TRANSACTIONAL, name, "ATOMICITY=TRANSACTIONAL");
             require(config.getCacheMode() == CacheMode.PARTITIONED, name, "PARTITIONED");
             require(config.getWriteSynchronizationMode() == CacheWriteSynchronizationMode.FULL_SYNC, name, "FULL_SYNC");
-            require(REGION.equals(config.getDataRegionName()), name,
-                    "DATA_REGION=" + REGION + "，实际=" + config.getDataRegionName()
-                            + "；旧表须由管理员按docs/ignite-memory.md切换");
             require("PUBLIC".equals(config.getSqlSchema()) || "\"PUBLIC\"".equals(config.getSqlSchema()), name,
                     "SQL_SCHEMA=PUBLIC，实际=" + config.getSqlSchema());
             require(config.getExpiryPolicy() == null, name, "禁止配置过期策略");

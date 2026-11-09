@@ -1,119 +1,110 @@
-# Ignite 心跳内存模式
+# Ignite默认内存区域部署
 
-2026-11-05确认：心跳只保存最新状态和最近N条有效更新，不要求Ignite全停后的数据恢复，不从Kafka历史重建窗口。全停后电梯随新心跳重新出现；离线电梯保持无数据。默认N=10，每梯最多11行（最新状态1行、历史最多10行）。
+2026-11-09确认：Ignite集群仅供本项目使用。心跳表使用服务端默认数据区域，允许RANDOM_2_LRU在内存压力下淘汰记录，也接受集群全停后窗口丢失；不重建Kafka历史。本文替代旧的heartbeat_memory专用区域部署步骤。
 
-当前CreatedDate、UpdatedDate、SendTime为TIMESTAMP，值类型为HeartbeatStateRowV4，并自动创建 `IDX_HB_STATE_CREATEDDATE`。旧VARCHAR日期表或SENDTIME仍为BIGINT的表，即使已经位于内存区域也需要按下面流程重建。时区、非法日期处理和查询示例见 [时间类型与索引](heartbeat-time.md#createddate索引与时间范围查询)。
+## 当前程序行为
 
-## 已核对的容器配置位置
+建表SQL不指定DATA_REGION，不硬编码默认区域名称。Ignite使用各节点的defaultDataRegionConfiguration，默认区域可以自定义名称，如Memory_Region。无需再增加heartbeat_memory区域。
 
-2026-11-05根据 `AI-slave06` 上的现场命令截图确认：
+正式 `--run` 启动及写入故障后的重新连接都会检查表，自动创建缺失的HB_STATE及CreatedDate索引。只读 `--check-ignite` 不建表。不做定时巡检、不自动删除已有表或修改字段类型；作业重试耗尽后需要重新提交。
 
-| 项目 | 已核对的信息 |
-| --- | --- |
-| 容器ID | `675e6559ebcf`，容器重建后需重新确认 |
-| IGNITE_HOME | `/opt/ignite/apache-ignite` |
-| 容器内默认配置文件 | `/opt/ignite/apache-ignite/config/default-config.xml`，已确认存在 |
-| Docker WorkingDir | `/opt/ignite`，不能用它直接推导XML位置 |
-| Docker启动命令 | `/bin/sh -c "$IGNITE_HOME/run.sh"` |
-| 数据目录挂载 | `/home/workdir/ignite2/standalone/ignite-data -> /opt/ignite/work` |
-| 配置文件挂载 | 当前Mounts输出未显示配置文件或配置目录挂载 |
-| CONFIG_URI | 本次环境变量查询未显示该变量 |
+Java继续检查ACTIVE、事务模式、同步模式、SQL字段及主键、二进制类型、无TTL以及CreatedDate索引，但不限制区域名称。客户端不能证明区域的持久化或淘汰配置，管理员需核对实际生效的服务端配置。已有结构兼容的表可继续使用原区域；不指定DATA_REGION只决定新建表的区域，不迁移已存在的表。
 
-`/opt/ignite/config/default-config.xml` 已确认不存在。宿主机历史候选路径 `/home/lwh/apache_ignite/ignite-2.18.0/config/default-config.xml` 未证实与该容器关联，不应直接当作当前配置修改目标。
+CreatedDate、UpdatedDate、SendTime均为TIMESTAMP，其他*_MS保持BIGINT；值类型HeartbeatStateRowV4，键类型HeartbeatStateKeyV2。当前仍为PARTITIONED、TRANSACTIONAL、FULL_SYNC、BACKUPS=0。
 
-在宿主机执行下面的一行命令查看默认XML：
+## 服务端配置
 
-```bash
-docker exec 675e6559ebcf cat /opt/ignite/apache-ignite/config/default-config.xml
-```
-
-需要确认启动脚本如何选择配置时执行：
-
-```bash
-docker exec 675e6559ebcf cat /opt/ignite/apache-ignite/run.sh
-```
-
-同日后续XML截图已确认文件中的配置：`workDirectory=/opt/ignite/work`，`walMode=FSYNC`；`dataRegionConfigurations` 列表中只有旧 `heartbeat` 区域，`persistenceEnabled=true`，`initialSize=67108864`（64MiB），`maxSize=268435456`（256MiB）。该文件尚未添加 `heartbeat_memory`，尚未完成内存模式切换。这些是文件内容核对结果，启动脚本选择及运行节点是否加载了最新文件仍需由管理员确认。
-
-应在现有列表中、旧 `heartbeat` 的 `</bean>` 之后与 `</list>` 之前追加下节的 `heartbeat_memory` 配置，保留旧区域与全局 `walMode=FSYNC`。新内存区域不因全局保留FSYNC就启用数据持久化。
-
-该XML当前没有单独挂载，修改前由管理员备份；同一容器重启通常保留容器文件，删除重建容器则不能依赖这些修改，长期配置应纳入宿主机挂载或镜像部署管理。
-
-## 服务管理员需要配置的内容
-
-本项目只连接已有Ignite 2.18.0服务，不启动或重启服务。请管理员在**实际加载的服务端配置**中，为所有承载心跳缓存的节点增加名为 `heartbeat_memory` 的DataRegion。下面是应合并到现有 `DataStorageConfiguration.dataRegionConfigurations` 列表中的配置片段，不是整份启动配置；不要覆盖其他区域或其他业务的持久化设置。
+截图中的默认区域配置为下列内容，应位于DataStorageConfiguration内部。已有该配置时无需重复添加。各服务端节点需核对实际加载的配置及容量，应用不会修改XML或启动Ignite。
 
 ```xml
-<bean class="org.apache.ignite.configuration.DataRegionConfiguration">
-    <property name="name" value="heartbeat_memory"/>
-    <property name="persistenceEnabled" value="false"/>
-    <property name="initialSize" value="268435456"/>
-    <property name="maxSize" value="2147483648"/>
-    <property name="pageEvictionMode" value="DISABLED"/>
-</bean>
+<property name="defaultDataRegionConfiguration">
+    <bean class="org.apache.ignite.configuration.DataRegionConfiguration">
+        <property name="name" value="Memory_Region"/>
+        <property name="initialSize" value="#{2L * 1024 * 1024 * 1024}"/>
+        <property name="maxSize" value="#{32L * 1024 * 1024 * 1024}"/>
+        <property name="persistenceEnabled" value="false"/>
+        <property name="pageEvictionMode" value="RANDOM_2_LRU"/>
+        <property name="evictionThreshold" value="0.7"/>
+    </bean>
+</property>
 ```
 
-256MiB初始内存、2GiB上限只是示例，管理员应按电梯数量、N、字段和索引开销及服务器/容器可用内存确定容量。它使用堆外内存，不能只看Java堆大小；已离线电梯不会自动删除，因此应按累计保留的电梯数规划容量。内存不足会导致写入失败，不能依靠任意淘汰缓存条目维持运行，否则会破坏最新状态和历史窗口的一致性。
+2GiB初始、32GiB上限均为每个节点的值，不是整个集群共用的32GiB。区域使用堆外内存，另需容纳JVM堆、其他区域和系统内存。0.7是淘汰阈值，不代表一次删除70%的记录，也不是严格的进程内存限制。允许淘汰可降低区域耗尽概率，但不能保证不会OOM或发生事务冲突。调整XML需按集群维护流程重启加载。
 
-新增区域需要管理员按现有集群流程重启相关节点。共享服务可能因为其他持久化区域而仍需激活为ACTIVE，由管理员完成。客户端无法通过缓存配置核实区域的 `persistenceEnabled`，需管理员核对生效配置。区域名称正确不能替代这个确认。
+## 已确认的集群目录
 
-只有HB_STATE的业务页使用该内存区域。服务日志、元数据、其他缓存以及Flink的HDFS检查点仍可能写磁盘，不能要求整机磁盘写入归零。不要用关闭整个服务WAL代替内存区域配置。
+2026-11-09现场确认AI-slave06上的容器名为ignite-node-1：
 
-## 本次从旧持久化表切换
+| 项目 | 宿主机路径 | 容器路径 |
+| --- | --- | --- |
+| 配置文件bind挂载 | /home/workdir/ignite2/cluster/config/default-config.xml | /opt/ignite/apache-ignite/config/default-config.xml |
+| 工作目录bind挂载 | /home/workdir/ignite2/cluster/ignite-data | /opt/ignite/work |
 
-1. 停止当前心跳YARN应用，确认没有旧心跳作业继续写HB_STATE。本次不保存或加载Savepoint，不恢复旧窗口。
-2. 管理员配置并启用 `heartbeat_memory` 区域，确认 `persistenceEnabled=false`。
-3. 旧表的数据区域不能通过 `CREATE TABLE IF NOT EXISTS` 改变。用户已接受清空本项目心跳数据，由管理员只删除本项目的旧表：
+IGNITE_HOME为 `/opt/ignite/apache-ignite`，启动命令为 `/bin/sh -c "$IGNITE_HOME/run.sh"`。已观察的环境变量未显示CONFIG_URI；挂载文件存在不能替代核对启动脚本实际加载的文件和运行指标。其他节点路径和容器名需要分别确认，不假设与node-1相同。
+
+```bash
+docker exec ignite-node-1 cat /opt/ignite/apache-ignite/run.sh
+docker inspect ignite-node-1 --format 'Mounts={{json .Mounts}} Cmd={{json .Config.Cmd}}'
+```
+
+修改宿主机挂载源并由管理员加载后，核对容器文件及本次启动日志：
+
+```bash
+docker exec ignite-node-1 cat /opt/ignite/apache-ignite/config/default-config.xml
+ignite_started_at=$(docker inspect --format '{{.State.StartedAt}}' ignite-node-1)
+docker logs --since "$ignite_started_at" ignite-node-1 2>&1 | grep -A 2 'Memory_Region'
+```
+
+预期persistence=false，32GiB配置对应maxCfg=32768MB。日志可能要等待下一轮周期指标才出现。
+
+## 更新和启动
+
+1. 停止所有旧心跳作业。
+2. 更新 `target/heartbeat-reader-0.1.0.jar`、sha256和 `sql/ignite2-heartbeat.sql`，保留服务器自己的local.properties及性能参数。按实际对外地址配置ignite.addresses，可填写多个以逗号分隔的节点客户端地址。
+3. 表不存在时直接启动，由程序创建。已有表若使用heartbeat_memory或旧字段类型，想切换到默认区域需由管理员执行下面SQL清空该表；不要删除整个Ignite工作目录。
 
    ```sql
    DROP TABLE IF EXISTS PUBLIC.HB_STATE;
    ```
 
-   不删除Ignite整个work/db/WAL目录，不影响其他表。程序不会自动DROP或迁移已有表。
-4. 更新项目 `target/heartbeat-reader-0.1.0.jar`、对应sha256及 `sql/ignite2-heartbeat.sql`。保留服务器自己的 `config/local.properties` 和性能参数，不用本地文件整份覆盖。
-5. 将 `kafka.group.id` 改为一个从未使用过的名称，例如 `heartbeat3-memory-20261105-01`。如果示例名已经使用过，另取新名称。代码会将缺失消费位点初始化到本次启动时各分区的末尾。
-6. 确保历史配置发布程序和共享HDFS文件可用，然后直接提交：
+4. 本次按新窗口上线。若要跳过Kafka积压，使用从未用过的新kafka.group.id且不加载Savepoint/Checkpoint；当前代码将缺失消费位点初始化到启动时末尾。沿用旧组会继续读取已提交位点后的消息，不会因切换区域而自动跳过积压。
 
    ```bash
    bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh
    ```
 
-   不加 `--from-savepoint` / `-s`。无需删除旧Kafka组或HDFS检查点目录。
+无需为程序取消区域指定而重启已正确配置的Ignite。服务端配置要变更时才由管理员安排节点重启。运行账号需有建表、建索引、查询和写入权限。
 
-正式 `--run` 会在连接后自动创建不存在的空HB_STATE，并检查完整结构。它使用与手工SQL相同的脚本，脚本已打进JAR，多Sink同时启动可安全执行。运行账号需要该表的创建、查询和读写权限。若服务不允许应用建表，管理员应在每次表消失后先执行建表脚本，再启动作业。
+## 淘汰后的数据语义
 
-已有HB_STATE如果仍在旧 `heartbeat` 区域，启动会报结构不匹配，不会静默沿用旧持久化表。`--check-config` 只校验本地配置；`--check-ignite` 保持只读，不建表，表不存在时会报错。需要启动前使用 `--check-ignite` 时，先由管理员执行建表脚本。
+RANDOM_2_LRU按数据页选择淘汰，不区分最新与历史槽位，不能保证只淘汰最旧历史。每梯最近N条是写入目标，不保证时刻齐全；SLOT=-1也可能消失，不再上报的电梯可能从表中消失。
 
-## 内存集群全停后的日常操作
+最新槽位丢失后，下次有效心跳从空状态开始，DB_SEQUENCE重新从1递增，并采用当时加载的历史条数策略。未丢失的其他历史槽位不会为此全部清空；重建期间可能混合新旧序号，DB_SEQUENCE不可用作跨丢失事件的稳定唯一标识或时间排序。历史查询按CreatedDate排序，过滤SLOT>=0；查最新快照使用SLOT=-1。新心跳逐渐覆盖历史，但不承诺恢复缺失记录。
 
-计划重启：先停止心跳作业，由管理员重启服务，再用新的消费组直接启动心跳作业，不携带恢复参数。表丢失时程序自动建空表，不进行任何历史数据重建。
+历史条数调整仍在电梯下一条被接受的新心跳事务内执行；最新槽位和其策略元数据若已丢失，就无法依赖它识别旧窗口大小，动态缩容不再具有完整窗口模式下的严格清理保证。容量管理以服务端内存区域和已接受的淘汰策略为准。
 
-第一条被接受的新心跳会建立该电梯最新状态和第一条历史，之后逐步补齐到N条；不足N条时不填充。CreatedDate、10分钟过期过滤和同梯严格递增判断继续生效。DB_SEQUENCE在该电梯空状态上从1开始。
+Flink的CreatedDate去重状态独立于Ignite。Ignite淘汰或重启不会清空Flink状态，只有通过时间、校验及顺序判断的后续心跳才入库。已排队或恢复重放且被允许写入的数据也可能建立窗口，不承诺恢复后表中只有重启后产生的消息。默认超过10分钟的源数据仍按既有规则过滤；该过滤不定时删除已入库旧行。
 
-现有Flink检查点、异常消息交付和短暂连接故障重试仍正常工作，但不承诺恢复Ignite丢失的窗口。意外重启时，若Flink尚在重试，客户端重新建立连接后可创建缺失表并继续处理；若任务已失败，人工重新提交。若要严格跳过停机期间所有消息，应停止旧任务，用新组且不携带恢复参数重提。单纯删除Ignite数据不会自动重置Kafka位置。
-
-当前 `BACKUPS=0`，多节点内存集群中单节点丢失也可能丢失该节点上的分区，并非只有全停才丢数据。此版本按当前单节点服务使用；多节点部署需管理员另行确定副本与分区丢失策略。
+BACKUPS=0在多节点集群中表示没有额外备份副本，单节点丢失也可能丢分区数据，且可能触发分区丢失保护影响后续访问。自动建缺失整表不能修复仍存在但已标记LOST的分区；出现该状态需管理员按集群策略处理。不在本次区域修改中更改备份数、分区丢失策略或自动重置分区。
 
 ## 验收
-
-管理员确认有效区域配置为 `persistenceEnabled=false`；SQL查看表的数据区域：
 
 ```sql
 SELECT CACHE_NAME, DATA_REGION_NAME FROM SYS.CACHES WHERE CACHE_NAME='HB_STATE';
 SELECT EID, COUNT(*) FROM PUBLIC.HB_STATE GROUP BY EID ORDER BY COUNT(*) DESC LIMIT 20;
-SELECT EID, CREATEDDATE, DB_SEQUENCE FROM PUBLIC.HB_STATE WHERE SLOT=-1 LIMIT 20;
+SELECT EID, CREATEDDATE, SENDTIME, DB_SEQUENCE FROM PUBLIC.HB_STATE WHERE SLOT=-1 LIMIT 20;
 ```
 
-区域应为 `heartbeat_memory`。N=10且未动态缩容时，每梯最多11行。第一次有效心跳为2行（最新和历史各1）；不应等待10条到齐才更新最新状态。
+省略DATA_REGION后，SYS.CACHES中的DATA_REGION_NAME可显示NULL，表示未显式指定区域，并非缺少区域；实际使用服务端配置的默认区域（截图为Memory_Region），结合节点运行配置及指标核实。无淘汰、未丢失元数据且配置N=10时每梯最多11行；允许淘汰后行数不足不代表解析失败。CreatedDate索引、动态策略、事务写入及监控继续保留。集群吞吐和真实压力下淘汰行为需在部署后观测。
 
-性能验收保持并行度、批大小、输入量及N一致，对比 `committed_per_s`、`commit_avg_ms`、队列、读取延迟与过期比例。纯内存去除了该区域业务数据的持久化开销，但仍有事务、索引、网络和同步读取成本，不保证一定达到所需吞吐。
+## 历史目录记录
 
-之前核实的 `/home/workdir/ignite2/standalone/ignite-data/db` 是旧持久化方案的目录记录。新内存窗口不以该目录中的旧分区文件恢复；旧目录由服务管理员管理，不作为本次上线的清理对象。
+旧单节点容器名为ignite-single，历史容器ID为675e6559ebcf。旧数据挂载 `/home/workdir/ignite2/standalone/ignite-data -> /opt/ignite/work`，旧配置位于容器 `/opt/ignite/apache-ignite/config/default-config.xml`，当时未单独挂载配置文件。旧持久化数据目录 `/home/workdir/ignite2/standalone/ignite-data/db` 位于/dev/sdb1、XFS的/home挂载。这些是旧部署记录，不作为当前集群配置修改目标。
 
-## 本地验证与产物
+旧heartbeat和heartbeat_memory区域不再是当前新版建表的必需配置。默认内存区域不恢复旧业务窗口，但Ignite日志、元数据、其他内部文件及Flink的HDFS检查点仍可能写盘。
 
-2026-11-05 TIMESTAMP及CreatedDate索引版通过Java 11全量 `mvn -o -B -ntp clean verify`：191项测试全部通过。新增真实SQL时间类型/毫秒/空值读写、跨客户端默认时区、时间范围与EXPLAIN索引命中、缺失索引补建、错误同名索引拒绝、旧VARCHAR表重建与二进制元数据隔离，以及UpdatedDate非法值分流验证。
+## 本地验证和部署包
 
-2026-11-05以Java 11执行 `mvn -o -B -ntp clean verify`，178项测试通过，失败、错误、跳过均为0。真实Ignite 2.18.0内存节点覆盖事务写入、窗口条数、全停丢失及新心跳重建、已有客户端重连后建空表、多个写入器并发建表、只读检查不创建表、错误区域拒绝，以及最终JAR独立进程使用内嵌SQL建表并读写。保留批量事务回滚、同梯并发和动态条数的测试。
+2026-11-09使用Java 11执行 `mvn -o -B -ntp clean verify`，196项测试通过，无失败、错误或跳过。真实Ignite 2.18.0使用自定义名称Memory_Region作为默认区域，开启RANDOM_2_LRU和0.7阈值，不配置heartbeat_memory；验证自动建表的实际运行区域、TIMESTAMP字段及索引、原客户端在服务重启后自动重建表、最终JAR独立进程建表写入。另用定向删除记录模拟部分窗口丢失，验证后续心跳仍可写入和重新积累；该模拟不代表实际压力淘汰顺序或集群节点故障测试。
 
-部署包为 `dist/heartbeat-reader-0.1.0-java11-memory-deploy.zip`，含JAR、校验值、SQL、脚本、示例配置和本文档，不包含实际 `local.properties`。服务端真实配置、内网YARN/Kafka/HDFS连接及吞吐尚需集群验收；本地测试不会修改用户集群。
+部署包为 `dist/heartbeat-reader-0.1.0-java11-default-region-deploy.zip`，包含JAR、sha256、SQL、脚本及更新文档，不包含服务器实际local.properties。尚未修改集群，真实压力下的淘汰、集群拓扑与分区丢失行为需要集群验收。

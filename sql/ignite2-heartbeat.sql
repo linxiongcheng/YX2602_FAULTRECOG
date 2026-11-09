@@ -3,7 +3,8 @@
 -- Business columns follow the document spelling and use unquoted SQL identifiers.
 -- Ignite normalizes identifiers to uppercase; queries can use eid, EId or EID without quotes.
 -- CreatedDate is the only business clock. WITH option quotes are Ignite DDL syntax, not column quotes.
--- The service owner must configure heartbeat_memory with persistenceEnabled=false and no eviction.
+-- Omit DATA_REGION to use the server's default region, including a custom-named default.
+-- The service owner configures persistenceEnabled=false; page eviction is allowed.
 -- RUN creates the table only if absent. No automatic DROP or migration of existing tables.
 -- A full in-memory cluster restart loses the window; new heartbeats rebuild it without historical replay.
 
@@ -65,7 +66,7 @@ CREATE TABLE IF NOT EXISTS PUBLIC.HB_STATE (
     HISTORY_POLICY_VERSION BIGINT,
     STORED_AT_MS BIGINT,
     PRIMARY KEY (EID, SLOT)
-) WITH "CACHE_NAME=HB_STATE,TEMPLATE=partitioned,ATOMICITY=TRANSACTIONAL,BACKUPS=0,WRITE_SYNCHRONIZATION_MODE=FULL_SYNC,DATA_REGION=heartbeat_memory,VALUE_TYPE=HeartbeatStateRowV4,KEY_TYPE=HeartbeatStateKeyV2,AFFINITY_KEY=EID";
+) WITH "CACHE_NAME=HB_STATE,TEMPLATE=partitioned,ATOMICITY=TRANSACTIONAL,BACKUPS=0,WRITE_SYNCHRONIZATION_MODE=FULL_SYNC,VALUE_TYPE=HeartbeatStateRowV4,KEY_TYPE=HeartbeatStateKeyV2,AFFINITY_KEY=EID";
 
 -- Supports CreatedDate ranges across elevators; use SLOT=-1 for latest state or SLOT>=0 for history.
 CREATE INDEX IF NOT EXISTS IDX_HB_STATE_CREATEDDATE ON PUBLIC.HB_STATE (CREATEDDATE);
