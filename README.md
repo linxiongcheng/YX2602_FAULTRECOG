@@ -16,6 +16,8 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 
 新版启动脚本自动将各TaskManager监控日志汇总到提交节点 `/home/xiong/projects/YX2602_FAULTRECOG/logs/heartbeat-monitor-<ApplicationID>.log`。需同步更新JAR和两个脚本，通过Flink现有REST接口读取，不依赖YARN运行期日志聚合。
 
+提交节点日志自动按大小清理：监控文件上限30MiB、采集器状态文件上限10MiB，均不保留备份，达到上限后清空当前文件旧内容并继续写新日志。支持仅重启采集器更新，参数及步骤见 [日志保留规则](docs/log-retention.md)。
+
 ## 实现范围
 
 ```text

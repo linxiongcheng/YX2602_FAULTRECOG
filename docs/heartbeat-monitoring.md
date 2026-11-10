@@ -38,8 +38,9 @@ logger.heartbeatPerf.level = INFO
 | 文件 | 内容 |
 | --- | --- |
 | `heartbeat-monitor.log` | 指向最近启动Application监控文件的便捷链接；已有同名普通文件时保留原文件 |
-| `heartbeat-monitor-application_实际ID.log` | 各TaskManager的性能摘要和检查点事件，按Application分文件追加 |
-| `collector-application_实际ID.log` | 汇总进程状态、新增条数及错误重试 |
+| `heartbeat-monitor-application_实际ID.log` | 各TaskManager性能摘要及检查点事件；默认30MiB上限、达到后清空旧内容、不留备份 |
+| `collector-application_实际ID.log` | 汇总进程状态及错误重试；默认10MiB上限、达到后清空旧内容、不留备份 |
+| `collector-application_实际ID.log.bootstrap` | JVM启动/未捕获异常输出，每次启动采集器覆盖；正常运行摘要写入上面的状态日志 |
 | `submit-日期时间-进程号.log` | 本次Flink提交输出及Application ID |
 | `collector-application_实际ID.pid` | 提交节点汇总进程的PID |
 | `.heartbeat-monitor-application_实际ID.offsets.json` | 事件去重位置，供汇总进程重启接续 |
@@ -47,6 +48,8 @@ logger.heartbeatPerf.level = INFO
 启动方式不变，仍可带 `--from-savepoint`。提交成功后脚本解析Application ID和Flink REST地址，用Java 11在提交节点启动一个独立后台进程（最大堆128MB），每30秒读取容器独立监控文件。不占Flink槽位，不需要Python、jq、新监听端口或YARN运行期日志聚合。提交节点必须能访问该Flink REST地址。
 
 容器独立文件位于 `-Dlog.file` 对应的TaskManager日志目录，名为 `heartbeat-monitor.log`，约256KiB轮转并保留上一份。Flink REST日志接口需能访问该目录，标准YARN布局下它与普通TaskManager日志位于同一目录。日志携带进程唯一事件ID和递增序号，汇总时按ID去重，事件时间使用北京时间。最终目录在运行启动脚本的提交节点，不要求各YARN节点共享项目目录。
+
+2026-11-10增加提交节点日志大小限制及旧备份自动淘汰；详见 [日志轮转与不停作业更新](log-retention.md)。默认每个Application的监控与状态日志合计约40MiB（30MiB监控＋10MiB状态，均无备份），不含bootstrap、提交输出及去重状态。不同Application的日志独立保留，不自动清理整个logs目录。文件清空不改变去重位置，不影响业务窗口或Kafka位点；持续查看应使用 `tail -F`。
 
 首批摘要产生并被轮询后（通常约30～60秒），直接查看最近启动作业：
 

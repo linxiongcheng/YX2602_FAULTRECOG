@@ -171,6 +171,134 @@ class HeartbeatLogCollectorTest {
         assertEquals("third\n", Files.readString(file));
     }
 
+    @Test void rollingFileKeepsNewestCompleteUtf8LinesAndDeletesOldestGeneration() throws Exception {
+        Path path = directory.resolve("status.log");
+        HeartbeatLogCollector.RollingFile log = new HeartbeatLogCollector.RollingFile(path, 4, 3);
+        for (String value : new String[]{"甲", "乙", "丙", "丁", "戊"}) log.append(value);
+        assertEquals("戊\n", Files.readString(path));
+        assertEquals("丁\n", Files.readString(directory.resolve("status.log.1")));
+        assertEquals("丙\n", Files.readString(directory.resolve("status.log.2")));
+        assertEquals("乙\n", Files.readString(directory.resolve("status.log.3")));
+        assertFalse(Files.exists(directory.resolve("status.log.4")));
+        log.append("完整的长行");
+        assertEquals("完整的长行\n", Files.readString(path));
+        assertEquals("戊\n", Files.readString(directory.resolve("status.log.1")));
+        log.append("尾");
+        assertEquals("尾\n", Files.readString(path));
+        assertEquals("完整的长行\n", Files.readString(directory.resolve("status.log.1")));
+    }
+
+    @Test void rotationRetainsDeduplicationAcrossPollsAndRestart() throws Exception {
+        Map<String, String> responses = new ConcurrentHashMap<>();
+        responses.put("/taskmanagers", "{\"taskmanagers\":[{\"id\":\"tm1\"}]}");
+        responses.put("/taskmanagers/tm1/logs", "{\"logs\":[{\"name\":\"heartbeat-monitor.log\"}]}");
+        String endpoint = "/taskmanagers/tm1/logs/heartbeat-monitor.log";
+        StringBuilder events = new StringBuilder();
+        for (int i = 1; i <= 6; i++) events.append(line("aaaa", i, "split"));
+        responses.put(endpoint, events.toString());
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            byte[] bytes = responses.get(exchange.getRequestURI().getPath()).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (java.io.OutputStream output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        try {
+            String url = "http://127.0.0.1:" + server.getAddress().getPort();
+            long limit = line("aaaa", 1, "split").getBytes(StandardCharsets.UTF_8).length;
+            HeartbeatLogCollector collector = new HeartbeatLogCollector(url, "application_1_9", directory, limit, 2);
+            assertEquals(6, collector.collectOnce());
+            assertEquals(0, collector.collectOnce());
+            Path current = directory.resolve("heartbeat-monitor-application_1_9.log");
+            assertEquals(line("aaaa", 6, "split"), Files.readString(current));
+            assertEquals(line("aaaa", 5, "split"), Files.readString(current.resolveSibling(current.getFileName() + ".1")));
+            assertEquals(line("aaaa", 4, "split"), Files.readString(current.resolveSibling(current.getFileName() + ".2")));
+            assertFalse(Files.exists(current.resolveSibling(current.getFileName() + ".3")));
+            collector = new HeartbeatLogCollector(url, "application_1_9", directory, limit, 2);
+            assertEquals(0, collector.collectOnce());
+            // A crash after rename but before append can leave only a backup plus the cursor.
+            Files.move(current, current.resolveSibling(current.getFileName() + ".1"),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            collector = new HeartbeatLogCollector(url, "application_1_9", directory, limit, 2);
+            assertEquals(0, collector.collectOnce());
+            responses.put(endpoint, events + line("aaaa", 7, "split"));
+            assertEquals(1, collector.collectOnce());
+            assertEquals(line("aaaa", 7, "split"), Files.readString(current));
+        } finally { server.stop(0); }
+    }
+
+    @Test void existingOversizedLogIsArchivedAndInvalidLimitsAreRejected() throws Exception {
+        Path path = directory.resolve("existing.log");
+        Files.writeString(path, "old content larger than limit\n");
+        HeartbeatLogCollector.RollingFile log = new HeartbeatLogCollector.RollingFile(path, 10, 1);
+        log.append("new");
+        assertEquals("new\n", Files.readString(path));
+        assertEquals("old content larger than limit\n", Files.readString(directory.resolve("existing.log.1")));
+        assertThrows(IllegalArgumentException.class, () -> new HeartbeatLogCollector.RollingFile(path, 0, 1));
+        assertThrows(IllegalArgumentException.class, () -> new HeartbeatLogCollector.RollingFile(path, 10, -1));
+        assertThrows(IllegalArgumentException.class, () -> new HeartbeatLogCollector.RollingFile(path, 10, 101));
+    }
+
+    @Test void failedRotationDoesNotAdvanceEventCursor() throws Exception {
+        Path current = directory.resolve("heartbeat-monitor-application_1_8.log");
+        Files.writeString(current, "existing\n");
+        Path blocked = Files.createDirectory(directory.resolve(current.getFileName() + ".1"));
+        Files.writeString(blocked.resolve("block"), "block replacement");
+        HeartbeatLogCollector collector = new HeartbeatLogCollector("http://localhost:8081", "application_1_8", directory, 4, 1);
+        String event = line("aaaa", 1, "split");
+        assertThrows(IOException.class, () -> collector.appendEvents(event));
+        Files.delete(blocked.resolve("block")); Files.delete(blocked);
+        assertEquals(1, collector.appendEvents(event));
+        assertEquals(0, collector.appendEvents(event));
+        assertEquals(event, Files.readString(current));
+    }
+
+    @Test void noBackupModeTruncatesOnLimitAndPrunesOnlyItsNumberedBackups() throws Exception {
+        Path file = directory.resolve("monitor.log");
+        Files.writeString(directory.resolve("monitor.log.1"), "old backup");
+        Files.writeString(directory.resolve("monitor.log.3"), "oldest backup");
+        Files.writeString(directory.resolve("other.log.1"), "other application");
+        HeartbeatLogCollector.RollingFile log = new HeartbeatLogCollector.RollingFile(file, 8, 0);
+        log.append("first");
+        log.append("next");
+        assertEquals("next\n", Files.readString(file));
+        assertFalse(Files.exists(directory.resolve("monitor.log.1")));
+        assertFalse(Files.exists(directory.resolve("monitor.log.3")));
+        assertEquals("other application", Files.readString(directory.resolve("other.log.1")));
+        log.append("x");
+        assertEquals("next\nx\n", Files.readString(file));
+    }
+
+    @Test void noBackupModeRetainsCursorAfterClearingCurrentLog() throws Exception {
+        Map<String, String> responses = new ConcurrentHashMap<>();
+        responses.put("/taskmanagers", "{\"taskmanagers\":[{\"id\":\"tm1\"}]}");
+        responses.put("/taskmanagers/tm1/logs", "{\"logs\":[{\"name\":\"heartbeat-monitor.log\"}]}");
+        String endpoint = "/taskmanagers/tm1/logs/heartbeat-monitor.log";
+        String events = line("aaaa", 1, "split") + line("aaaa", 2, "split");
+        responses.put(endpoint, events);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            byte[] bytes = responses.get(exchange.getRequestURI().getPath()).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (java.io.OutputStream output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        try {
+            String url = "http://127.0.0.1:" + server.getAddress().getPort();
+            long limit = line("aaaa", 1, "split").getBytes(StandardCharsets.UTF_8).length;
+            HeartbeatLogCollector collector = new HeartbeatLogCollector(url, "application_1_10", directory, limit, 0);
+            assertEquals(2, collector.collectOnce());
+            Path file = directory.resolve("heartbeat-monitor-application_1_10.log");
+            assertEquals(line("aaaa", 2, "split"), Files.readString(file));
+            collector = new HeartbeatLogCollector(url, "application_1_10", directory, limit, 0);
+            assertEquals(0, collector.collectOnce());
+            responses.put(endpoint, events + line("aaaa", 3, "split"));
+            assertEquals(1, collector.collectOnce());
+            assertEquals(line("aaaa", 3, "split"), Files.readString(file));
+            assertFalse(Files.exists(file.resolveSibling(file.getFileName() + ".1")));
+        } finally { server.stop(0); }
+    }
+
     @Test void rejectsUnsafeUrlAndApplicationPath() {
         assertThrows(IllegalArgumentException.class,
                 () -> new HeartbeatLogCollector("file:///tmp", "application_1_1", directory));

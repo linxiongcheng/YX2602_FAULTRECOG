@@ -3,7 +3,6 @@ package com.hitachi.yx2602.heartbeat;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -28,9 +27,17 @@ public final class HeartbeatLogCollector {
     private static final Pattern EVENT = Pattern.compile("event_id=([a-f0-9-]+):([0-9]+) ");
     private final String baseUrl;
     private final Path output, state;
+    private final RollingFile monitorLog;
     private final Map<String, Long> positions = new LinkedHashMap<>();
 
     HeartbeatLogCollector(String baseUrl, String applicationId, Path directory) throws IOException {
+        this(baseUrl, applicationId, directory,
+                longProperty("heartbeat.collector.monitor.max.bytes", 30L * 1024 * 1024),
+                backupProperty("heartbeat.collector.monitor.backup.count", 0));
+    }
+
+    HeartbeatLogCollector(String baseUrl, String applicationId, Path directory,
+                          long maxBytes, int backups) throws IOException {
         URI uri = URI.create(baseUrl);
         if (!("http".equals(uri.getScheme()) || "https".equals(uri.getScheme())) || uri.getHost() == null
                 || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
@@ -40,8 +47,9 @@ public final class HeartbeatLogCollector {
         this.baseUrl = baseUrl.replaceAll("/+$", "");
         Files.createDirectories(directory);
         output = directory.resolve("heartbeat-monitor-" + applicationId + ".log");
+        monitorLog = new RollingFile(output, maxBytes, backups);
         state = directory.resolve(".heartbeat-monitor-" + applicationId + ".offsets.json");
-        if (Files.exists(state) && Files.exists(output)) {
+        if (Files.exists(state) && (Files.exists(output) || Files.exists(monitorLog.backup(1)))) {
             JsonNode saved = JSON.readTree(Files.readAllBytes(state));
             saved.fields().forEachRemaining(entry -> positions.put(entry.getKey(), entry.getValue().asLong()));
         }
@@ -62,15 +70,18 @@ public final class HeartbeatLogCollector {
                 System.out.println("collected=" + collector.collectOnce());
                 return;
             }
+            RollingFile statusLog = new RollingFile(Paths.get(args[5]).resolve("collector-" + args[3] + ".log"),
+                    longProperty("heartbeat.collector.status.max.bytes", 10L * 1024 * 1024),
+                    backupProperty("heartbeat.collector.status.backup.count", 0));
             int failures = 0;
             while (!Thread.currentThread().isInterrupted() && failures < 10) {
                 try {
                     int added = collector.collectOnce();
                     failures = 0;
-                    System.out.println(Instant.now() + " collected=" + added + " output=" + collector.output);
+                    statusLog.append(Instant.now() + " collected=" + added + " output=" + collector.output);
                 } catch (IOException error) {
                     failures++;
-                    System.err.println(Instant.now() + " collector_retry=" + failures + "/10 error="
+                    statusLog.append(Instant.now() + " collector_retry=" + failures + "/10 error="
                             + error.getClass().getSimpleName() + " message=" + error.getMessage());
                 }
                 if (failures < 10) Thread.sleep(30000);
@@ -122,24 +133,73 @@ public final class HeartbeatLogCollector {
         int added = 0;
         int complete = text.lastIndexOf('\n');
         if (complete < 0) return 0;
-        try (BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
-            for (String line : text.substring(0, complete).split("\n")) {
-                Matcher event = EVENT.matcher(line);
-                if (!event.find() || !(line.contains("[HEARTBEAT-PERF]") || line.contains("[HEARTBEAT-CHECKPOINT]"))) continue;
-                String stream = event.group(1);
-                long sequence;
-                try { sequence = Long.parseLong(event.group(2)); }
-                catch (NumberFormatException invalid) { continue; }
-                if (sequence <= positions.getOrDefault(stream, 0L)) continue;
-                writer.write(line); writer.newLine();
-                // Flush before advancing the cursor so a failed local write is retried.
-                writer.flush();
-                positions.put(stream, sequence);
-                added++;
-            }
+        for (String line : text.substring(0, complete).split("\n")) {
+            Matcher event = EVENT.matcher(line);
+            if (!event.find() || !(line.contains("[HEARTBEAT-PERF]") || line.contains("[HEARTBEAT-CHECKPOINT]"))) continue;
+            String stream = event.group(1);
+            long sequence;
+            try { sequence = Long.parseLong(event.group(2)); }
+            catch (NumberFormatException invalid) { continue; }
+            if (sequence <= positions.getOrDefault(stream, 0L)) continue;
+            // Complete the append before advancing the cursor; rotating does not reset positions.
+            monitorLog.append(line);
+            positions.put(stream, sequence);
+            added++;
         }
         return added;
+    }
+
+    private static long longProperty(String name, long defaultValue) {
+        long value = Long.parseLong(System.getProperty(name, Long.toString(defaultValue)));
+        if (value <= 0) throw new IllegalArgumentException(name + " must be positive");
+        return value;
+    }
+
+    private static int backupProperty(String name, int defaultValue) {
+        long value = Long.parseLong(System.getProperty(name, Integer.toString(defaultValue)));
+        if (value < 0 || value > 100) throw new IllegalArgumentException(name + " must be 0..100");
+        return (int) value;
+    }
+
+    /** Single collector owns these files under its application lock; no persistent open handles. */
+    static final class RollingFile {
+        private final Path file;
+        private final long maxBytes;
+        private final int backups;
+        private boolean cleanupPending = true;
+
+        RollingFile(Path file, long maxBytes, int backups) {
+            if (maxBytes <= 0 || backups < 0 || backups > 100) {
+                throw new IllegalArgumentException("Log max bytes must be positive; backups must be 0..100");
+            }
+            this.file = file; this.maxBytes = maxBytes; this.backups = backups;
+        }
+
+        Path backup(int number) { return file.resolveSibling(file.getFileName() + "." + number); }
+
+        void append(String line) throws IOException {
+            byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
+            if (cleanupPending) {
+                // Only this application's reserved numbered backups, under its collector lock.
+                for (int i = backups + 1; i <= 100; i++) Files.deleteIfExists(backup(i));
+                cleanupPending = false;
+            }
+            long size = Files.exists(file) ? Files.size(file) : 0;
+            if (size > 0 && (size >= maxBytes || bytes.length > maxBytes - size)) {
+                if (backups == 0) {
+                    Files.write(file, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                    return;
+                }
+                for (int i = backups - 1; i >= 1; i--) {
+                    if (Files.exists(backup(i))) {
+                        Files.move(backup(i), backup(i + 1), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+                Files.move(file, backup(1), StandardCopyOption.REPLACE_EXISTING);
+            }
+            // Keep complete records even if a single unusually long line exceeds the limit.
+            Files.write(file, bytes, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        }
     }
 
     private void savePositions() throws IOException {

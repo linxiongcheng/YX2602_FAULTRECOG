@@ -25,15 +25,19 @@ if [[ -r "$pid_file" ]]; then
 fi
 
 nohup /opt/java11/bin/java -Xms32m -Xmx128m -Dfile.encoding=UTF-8 \
+  "-Dheartbeat.collector.monitor.max.bytes=${HEARTBEAT_MONITOR_MAX_BYTES:-31457280}" \
+  "-Dheartbeat.collector.monitor.backup.count=${HEARTBEAT_MONITOR_BACKUP_COUNT:-0}" \
+  "-Dheartbeat.collector.status.max.bytes=${HEARTBEAT_COLLECTOR_MAX_BYTES:-10485760}" \
+  "-Dheartbeat.collector.status.backup.count=${HEARTBEAT_COLLECTOR_BACKUP_COUNT:-0}" \
   -cp /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
   com.hitachi.yx2602.heartbeat.HeartbeatLogCollector \
   --rest-url "$rest_url" --application-id "$application_id" --output-dir "$log_dir" \
-  >> "$collector_log" 2>&1 < /dev/null &
+  > "$collector_log.bootstrap" 2>&1 < /dev/null &
 collector_pid=$!
 printf '%s\n' "$collector_pid" > "$pid_file"
 sleep 1
 if ! kill -0 "$collector_pid" 2>/dev/null; then
-  printf 'Collector exited; inspect %s\n' "$collector_log" >&2
+  printf 'Collector exited; inspect %s and %s.bootstrap\n' "$collector_log" "$collector_log" >&2
   exit 1
 fi
 latest_log="$log_dir/heartbeat-monitor.log"

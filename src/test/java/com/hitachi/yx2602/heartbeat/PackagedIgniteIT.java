@@ -16,7 +16,9 @@ import static org.junit.jupiter.api.Assertions.*;
 class PackagedIgniteIT {
     @TempDir Path directory;
 
-    @Test @Timeout(30) void packagedLogCollectorRunsWithoutFlinkLibraries() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    @Timeout(30) void packagedLogCollectorRunsWithoutFlinkLibraries(boolean once) throws Exception {
         com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
                 new java.net.InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
@@ -31,17 +33,38 @@ class PackagedIgniteIT {
         });
         server.start();
         Path log = directory.resolve("collector.log"), output = directory.resolve("logs");
+        Files.createDirectories(output);
+        Path status = output.resolve("collector-application_1_1.log");
+        Files.writeString(status, "previous status\n");
         try {
-            Process process = new ProcessBuilder(Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
+            java.util.List<String> command = new java.util.ArrayList<>(java.util.Arrays.asList(
+                    Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Dheartbeat.collector.status.max.bytes=1",
+                    "-Dheartbeat.collector.status.backup.count=0",
                     "-cp", Paths.get("target/heartbeat-reader-0.1.0.jar").toAbsolutePath().toString(),
                     HeartbeatLogCollector.class.getName(), "--rest-url", "http://127.0.0.1:" + server.getAddress().getPort(),
-                    "--application-id", "application_1_1", "--output-dir", output.toString(), "--once")
+                    "--application-id", "application_1_1", "--output-dir", output.toString()));
+            if (once) command.add("--once");
+            Process process = new ProcessBuilder(command)
                     .redirectErrorStream(true).redirectOutput(log.toFile()).start();
             try {
-                assertTrue(process.waitFor(20, TimeUnit.SECONDS));
-                assertEquals(0, process.exitValue(), Files.readString(log));
+                if (once) {
+                    assertTrue(process.waitFor(20, TimeUnit.SECONDS));
+                    assertEquals(0, process.exitValue(), Files.readString(log));
+                } else {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+                    while (System.nanoTime() < deadline && process.isAlive()) {
+                        if (Files.exists(status) && Files.readString(status).contains("collected=1")) break;
+                        Thread.sleep(50);
+                    }
+                    assertTrue(Files.readString(status).contains("collected=1"), Files.readString(log));
+                    assertFalse(Files.exists(status.resolveSibling(status.getFileName() + ".1")));
+                }
                 assertTrue(Files.readString(output.resolve("heartbeat-monitor-application_1_1.log")).contains("committed=10"));
-            } finally { if (process.isAlive()) process.destroyForcibly(); }
+            } finally {
+                if (process.isAlive()) process.destroyForcibly();
+                assertTrue(process.waitFor(5, TimeUnit.SECONDS));
+            }
         } finally { server.stop(0); }
     }
 
