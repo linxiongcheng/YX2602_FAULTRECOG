@@ -237,7 +237,7 @@ public final class HeartbeatPerformanceReport {
             out.append("（没有样本，不能按0吞吐解读）\n\n");
             return;
         }
-        out.append("（合计 ").append(integer(stats.sum(counter))).append(" 条，覆盖 ").append(f(stats.seconds()))
+        out.append("（已采集 ").append(integer(stats.sum(counter))).append(" 条，覆盖 ").append(f(stats.seconds()))
                 .append(" 秒，子任务 ").append(stats.coverage()).append('/').append(stats.parallelism()).append("）");
         Peak peak = stats.peak(counter);
         if (peak == null) out.append("；最高：—（缺少完整的并行采样窗口）\n\n");
@@ -245,7 +245,8 @@ public final class HeartbeatPerformanceReport {
                 .append(f(peak.windowMs / 1000)).append("秒采样窗口）\n\n");
         if (stats.coverage() < stats.parallelism()) out.append("提示：").append(label).append("缺少子任务样本，不能代表全作业。\n\n");
         if (stats.seconds() < minutes * 60 - 1) out.append("提示：").append(label).append("样本不足").append(minutes)
-                .append("分钟，按实际覆盖时间计算平均值。\n\n");
+                .append("分钟；条数、平均值和最高值仅代表已采集区间，不是完整")
+                .append(minutes).append("分钟指标。未采集区间不按0计数，也不外推补齐。\n\n");
     }
 
     private static void countRow(StringBuilder out, String label, Stats stats, String key, String note) {

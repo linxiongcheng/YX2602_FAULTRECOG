@@ -141,9 +141,9 @@ class HeartbeatPerformanceReportTest {
             }
         }
         String report = HeartbeatPerformanceReport.analyze(Collections.singletonList(log(text.toString())), 5, false, NOW, true);
-        assertTrue(report.contains("消费平均：20.000 条原始消息/秒（合计 6000 条，覆盖 300.000 秒，子任务 2/2）"), report);
-        assertTrue(report.contains("解析平均：30.000 条单梯消息/秒（合计 9000 条，覆盖 300.000 秒，子任务 2/2）"), report);
-        assertTrue(report.contains("Ignite写入平均：13.333 条单梯更新/秒（合计 4000 条，覆盖 300.000 秒，子任务 2/2）"), report);
+        assertTrue(report.contains("消费平均：20.000 条原始消息/秒（已采集 6000 条，覆盖 300.000 秒，子任务 2/2）"), report);
+        assertTrue(report.contains("解析平均：30.000 条单梯消息/秒（已采集 9000 条，覆盖 300.000 秒，子任务 2/2）"), report);
+        assertTrue(report.contains("Ignite写入平均：13.333 条单梯更新/秒（已采集 4000 条，覆盖 300.000 秒，子任务 2/2）"), report);
         assertFalse(report.contains("## 各路Sink"));
         assertFalse(report.contains("## 计算、等待与延迟"));
     }
@@ -154,6 +154,8 @@ class HeartbeatPerformanceReportTest {
         assertTrue(report.contains("消费平均：— 条原始消息/秒（没有样本，不能按0吞吐解读）"));
         assertTrue(report.contains("Ignite写入平均：10.000 条单梯更新/秒"));
         assertTrue(report.contains("样本不足5分钟"));
+        assertTrue(report.contains("不是完整5分钟指标"));
+        assertTrue(report.contains("未采集区间不按0计数，也不外推补齐"));
         assertTrue(report.contains("缺少子任务样本"));
         assertTrue(report.contains("最高：—（缺少完整的并行采样窗口）"));
         String old = HeartbeatPerformanceReport.analyze(Collections.singletonList(path), 5, false, NOW.plusSeconds(3600), true);
