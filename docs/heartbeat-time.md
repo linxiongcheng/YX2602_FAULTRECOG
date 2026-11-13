@@ -85,7 +85,30 @@ SQL中的 `SENDTIME` 改为可空TIMESTAMP。输入仍按原协议读取正64位
 
 建表不再指定DATA_REGION，启动校验不限制区域名。允许最新和历史记录因RANDOM_2_LRU淘汰而丢失，DB_SEQUENCE在最新槽位丢失后会重新开始，历史条数不保证完整；查询仍以CreatedDate排序。具体部署及语义见 [默认区域内存模式](ignite-memory.md)。
 
+## EID、INTID索引（2026-11-13）
+
+2026-11-13在CreatedDate索引之外新增两个独立标识符索引：
+
+```sql
+CREATE INDEX IF NOT EXISTS IDX_HB_STATE_EID ON PUBLIC.HB_STATE (EID);
+CREATE INDEX IF NOT EXISTS IDX_HB_STATE_INTID ON PUBLIC.HB_STATE (INTID);
+```
+
+已有HB_STATE可以直接执行上述SQL，无需删除表或清空数据。更新后的正式作业在启动和故障重连时自动补建缺失索引，并核实三个索引各自的类型及首列；只读 `--check-ignite` 不创建索引。表字段、二进制值类型和CreatedDate索引不变。
+
+EID本来就是复合主键(EID,SLOT)的首列，已有主键索引通常可以支持EID查询；本次按需求另建独立EID索引，查询计划可能继续选择主键索引。INTID为独立业务字段，其索引支持按INTID定位记录。两个新增索引覆盖最新与历史槽位，会增加内存及每次写入的索引维护开销，不用于提高写入吞吐。
+
+可查看实际索引定义：
+
+```sql
+SELECT INDEX_NAME, INDEX_TYPE, COLUMNS FROM SYS.INDEXES
+WHERE CACHE_NAME='HB_STATE'
+  AND INDEX_NAME IN ('IDX_HB_STATE_CREATEDDATE','IDX_HB_STATE_EID','IDX_HB_STATE_INTID');
+```
+
 ## 验证结果
+
+2026-11-13新增标识符索引通过Java 11下35项真实Ignite存储测试：覆盖三个索引缺失补建、只读检查不补建、错误同名索引拒绝、已有数据保留、EID/INTID查询及EXPLAIN命中INTID索引。本次不涉及表字段迁移。
 
 2026-11-06 SENDTIME类型版本在Java 11下执行 `mvn -o -B -ntp clean verify`，194项测试通过，无失败、错误或跳过。覆盖三个端口到SQL的字段类型、最新及历史槽位的SENDTIME时间值与毫秒精度、NULL与CreatedDate排序独立性、跨默认时区写入、旧V3/BIGINT表拒绝与重建，以及独立UTC客户端运行最终JAR。
 

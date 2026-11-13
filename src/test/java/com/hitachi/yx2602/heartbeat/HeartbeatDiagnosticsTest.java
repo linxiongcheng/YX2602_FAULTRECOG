@@ -18,6 +18,19 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(15)
 class HeartbeatDiagnosticsTest {
+    @Test void topicQualifiedOffsetsDoNotOverwriteOtherTopicsOrCollideOnPunctuation() {
+        HeartbeatDiagnostics monitor = new HeartbeatDiagnostics("validation", "test", 30000);
+        monitor.observedOffset("heartbeat1", 0, 10);
+        monitor.observedOffset("heartbeat2", 0, 20);
+        monitor.observedOffset("heartbeat3", 0, 30);
+        monitor.observedOffset("heartbeat-v1", 0, 40);
+        monitor.observedOffset("heartbeat_v1", 0, 50);
+        String snapshot = monitor.snapshot();
+        for (String pair : new String[]{"heartbeat1_p0=10", "heartbeat2_p0=20", "heartbeat3_p0=30",
+                "heartbeat-v1_p0=40", "heartbeat_v1_p0=50"}) {
+            assertTrue(snapshot.contains("observed_offset_" + pair), snapshot);
+        }
+    }
     @Test void windowsSeparateWorkAndEmitTimeAndShowInflightOperationWithoutCompletion() {
         AtomicLong clock = new AtomicLong();
         List<String> logs = new ArrayList<>();

@@ -24,17 +24,25 @@ if [[ -r "$pid_file" ]]; then
   fi
 fi
 
+# Preserve bootstrap output across collector restarts; the stable name becomes a link.
+bootstrap_log="$collector_log.bootstrap.$(TZ=Asia/Shanghai date +%Y-%m-%d).$$"
+if [[ -e "$collector_log.bootstrap" && ! -L "$collector_log.bootstrap" ]]; then
+  mv -- "$collector_log.bootstrap" "$collector_log.bootstrap.legacy.$(date +%s).$$"
+fi
+
 nohup /opt/java11/bin/java -Xms32m -Xmx128m -Dfile.encoding=UTF-8 \
   "-Dheartbeat.collector.monitor.max.bytes=${HEARTBEAT_MONITOR_MAX_BYTES:-31457280}" \
-  "-Dheartbeat.collector.monitor.backup.count=${HEARTBEAT_MONITOR_BACKUP_COUNT:-0}" \
   "-Dheartbeat.collector.status.max.bytes=${HEARTBEAT_COLLECTOR_MAX_BYTES:-10485760}" \
-  "-Dheartbeat.collector.status.backup.count=${HEARTBEAT_COLLECTOR_BACKUP_COUNT:-0}" \
+  "-Dheartbeat.collector.retention.days=${HEARTBEAT_LOG_RETENTION_DAYS:-7}" \
   -cp /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
   com.hitachi.yx2602.heartbeat.HeartbeatLogCollector \
   --rest-url "$rest_url" --application-id "$application_id" --output-dir "$log_dir" \
-  > "$collector_log.bootstrap" 2>&1 < /dev/null &
+  > "$bootstrap_log" 2>&1 < /dev/null &
 collector_pid=$!
 printf '%s\n' "$collector_pid" > "$pid_file"
+if ! ln -sfn "${bootstrap_log##*/}" "$collector_log.bootstrap"; then
+  printf 'Could not update bootstrap link; inspect %s\n' "$bootstrap_log" >&2
+fi
 sleep 1
 if ! kill -0 "$collector_pid" 2>/dev/null; then
   printf 'Collector exited; inspect %s and %s.bootstrap\n' "$collector_log" "$collector_log" >&2

@@ -50,6 +50,26 @@ class HeartbeatPipelineTest {
         assertTrue(TypeInformation.of(HeartbeatMessage.class) instanceof PojoTypeInfo);
     }
 
+    @Test void sourceSubscribesToThreeDistinctTopicsInsteadOfOneCommaContainingName() throws Exception {
+        java.util.Properties p = ReaderConfigTest.properties();
+        p.setProperty("kafka.input.topic", "heartbeat1,heartbeat2,heartbeat3");
+        ReaderConfig config = ReaderConfig.from(p, key -> null);
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        HeartbeatReader.configureEnvironment(env, config);
+        SingleOutputStreamOperator<HeartbeatMessage> valid = HeartbeatReader.createGraph(env, config);
+        org.apache.flink.streaming.api.transformations.OneInputTransformation<?, ?> validation =
+                (org.apache.flink.streaming.api.transformations.OneInputTransformation<?, ?>) valid.getTransformation();
+        org.apache.flink.streaming.api.transformations.SourceTransformation<?, ?, ?> source =
+                (org.apache.flink.streaming.api.transformations.SourceTransformation<?, ?, ?>) validation.getInputs().get(0);
+        // Inspect the actual pinned connector subscription without requiring a Kafka broker in unit tests.
+        java.lang.reflect.Field subscriber = source.getSource().getClass().getDeclaredField("subscriber");
+        subscriber.setAccessible(true);
+        Object subscription = subscriber.get(source.getSource());
+        java.lang.reflect.Field topics = subscription.getClass().getDeclaredField("topics");
+        topics.setAccessible(true);
+        assertEquals(Arrays.asList("heartbeat1", "heartbeat2", "heartbeat3"), topics.get(subscription));
+    }
+
     @Test @Timeout(90)
     void actualFlinkRuntimeRoutesHistoricalValidAndInvalidMessages() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();

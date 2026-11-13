@@ -254,6 +254,7 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
         static final int LATEST_SLOT = -1;
         static final String VALUE_TYPE = "HeartbeatStateRowV4", KEY_TYPE = "HeartbeatStateKeyV2";
         static final String CREATED_DATE_INDEX = "IDX_HB_STATE_CREATEDDATE";
+        static final String EID_INDEX = "IDX_HB_STATE_EID", INT_ID_INDEX = "IDX_HB_STATE_INTID";
         static final Map<String, Field> STATE_FIELDS;
         static final Map<String, Class<?>> VALUE_FIELDS;
 
@@ -336,13 +337,16 @@ final class IgniteHeartbeatStore implements AsyncHeartbeatWriter.Store {
             if (!caches.contains(CACHE)) throw new IllegalStateException("缺少缓存" + CACHE + "，请先执行sql/ignite2-heartbeat.sql");
             validate(client.cache(CACHE).getConfiguration());
             // Dynamic SQL indexes are not included in thin-client cache configuration snapshots.
-            try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = client.query(new SqlFieldsQuery(
-                    "SELECT INDEX_TYPE, COLUMNS FROM SYS.INDEXES WHERE CACHE_NAME=? AND INDEX_NAME=?")
-                    .setArgs(CACHE, CREATED_DATE_INDEX))) {
-                List<List<?>> indexes = cursor.getAll();
-                require(indexes.size() == 1 && "SORTED".equals(indexes.get(0).get(0))
-                                && "\"CREATEDDATE\" ASC".equals(String.valueOf(indexes.get(0).get(1)).split(",", 2)[0].trim()),
-                        CACHE, "索引" + CREATED_DATE_INDEX + "须以CREATEDDATE ASC为首列");
+            for (String[] index : new String[][]{{CREATED_DATE_INDEX, "CREATEDDATE"},
+                    {EID_INDEX, "EID"}, {INT_ID_INDEX, "INTID"}}) {
+                try (org.apache.ignite.cache.query.FieldsQueryCursor<List<?>> cursor = client.query(new SqlFieldsQuery(
+                        "SELECT INDEX_TYPE, COLUMNS FROM SYS.INDEXES WHERE CACHE_NAME=? AND INDEX_NAME=?")
+                        .setArgs(CACHE, index[0]))) {
+                    List<List<?>> indexes = cursor.getAll();
+                    require(indexes.size() == 1 && "SORTED".equals(indexes.get(0).get(0))
+                                    && ("\"" + index[1] + "\" ASC").equals(String.valueOf(indexes.get(0).get(1)).split(",", 2)[0].trim()),
+                            CACHE, "索引" + index[0] + "须以" + index[1] + " ASC为首列");
+                }
             }
         }
 

@@ -70,7 +70,7 @@ public final class HeartbeatReader {
             StreamExecutionEnvironment env, ReaderConfig config) {
         KafkaSource<RawHeartbeat> source = KafkaSource.<RawHeartbeat>builder()
                 .setBootstrapServers(config.bootstrapServers)
-                .setTopics(config.inputTopic)
+                .setTopics(config.inputTopics)
                 .setGroupId(config.groupId)
                 .setProperties(config.consumerProperties())
                 // 首次缺失的位点已初始化到分区末尾；从检查点恢复时优先使用检查点位点。
@@ -108,12 +108,11 @@ public final class HeartbeatReader {
         properties.setProperty("default.api.timeout.ms", "60000");
         try (AdminClient admin = AdminClient.create(properties)) {
             // 输入和异常 Topic 都须预先创建，启动时检查名称和可访问性。
-            Map<String, TopicDescription> topics = admin.describeTopics(
-                    java.util.Arrays.asList(config.inputTopic, config.errorTopic))
+            Set<String> topicNames = new java.util.LinkedHashSet<>(config.inputTopics);
+            topicNames.add(config.errorTopic);
+            Map<String, TopicDescription> topics = admin.describeTopics(topicNames)
                     .allTopicNames().get(60, TimeUnit.SECONDS);
-            Set<TopicPartition> partitions = topics.get(config.inputTopic).partitions().stream()
-                    .map(partition -> new TopicPartition(config.inputTopic, partition.partition()))
-                    .collect(Collectors.toSet());
+            Set<TopicPartition> partitions = inputPartitions(config, topics);
             Map<TopicPartition, OffsetAndMetadata> committed = admin.listConsumerGroupOffsets(config.groupId)
                     .partitionsToOffsetAndMetadata().get(60, TimeUnit.SECONDS);
             Set<TopicPartition> missing = missingPartitions(partitions, committed);
@@ -135,6 +134,11 @@ public final class HeartbeatReader {
                                                 Map<TopicPartition, OffsetAndMetadata> committed) {
         return partitions.stream().filter(partition -> committed.get(partition) == null)
                 .collect(Collectors.toSet());
+    }
+
+    static Set<TopicPartition> inputPartitions(ReaderConfig config, Map<String, TopicDescription> topics) {
+        return config.inputTopics.stream().flatMap(name -> topics.get(name).partitions().stream()
+                .map(partition -> new TopicPartition(name, partition.partition()))).collect(Collectors.toSet());
     }
 
     /** 保留原始字节和 Kafka 来源信息，非法编码也能进入异常 Topic 供排查。 */
@@ -187,7 +191,7 @@ public final class HeartbeatReader {
         @Override
         public void processElement(RawHeartbeat record, Context ctx, Collector<HeartbeatMessage> out) {
             diagnostics.add("input", 1);
-            diagnostics.observedOffset(record.partition, record.offset);
+            diagnostics.observedOffset(record.topic, record.partition, record.offset);
             long now = System.currentTimeMillis();
             if (record.kafkaTimestampMs > 0) diagnostics.sampleMs("kafka_age", now - record.kafkaTimestampMs);
             long started = diagnostics.begin("validate");

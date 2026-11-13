@@ -8,7 +8,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.Function;
@@ -20,6 +23,7 @@ public final class ReaderConfig implements Serializable {
     private static final long serialVersionUID = 1L;
     private static final Pattern ENV = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]*)}");
     public final String bootstrapServers, inputTopic, errorTopic, groupId, checkpointStorage, jobName;
+    public final List<String> inputTopics;
     public final int parallelism, restartAttempts, deliveryTimeoutMs, maxRequestBytes;
     public final long futureSkewMs, checkpointIntervalMs, checkpointTimeoutMs, restartDelayMs;
     public final long parserMaxAgeMs;
@@ -48,9 +52,16 @@ public final class ReaderConfig implements Serializable {
             }
         }
         bootstrapServers = required(p, "kafka.bootstrap.servers");
-        inputTopic = topic(required(p, "kafka.input.topic"));
+        inputTopic = required(p, "kafka.input.topic");
+        List<String> inputs = new ArrayList<>();
+        for (String name : inputTopic.split(",", -1)) {
+            String input = topic(name.trim());
+            if (inputs.contains(input)) throw new IllegalArgumentException("输入Topic重复: " + input);
+            inputs.add(input);
+        }
+        inputTopics = Collections.unmodifiableList(inputs);
         errorTopic = topic(required(p, "kafka.error.topic"));
-        if (inputTopic.equals(errorTopic)) {
+        if (inputTopics.contains(errorTopic)) {
             throw new IllegalArgumentException("输入Topic和异常Topic不能相同");
         }
         groupId = required(p, "kafka.group.id");
@@ -145,7 +156,7 @@ public final class ReaderConfig implements Serializable {
 
     private static String topic(String name) {
         if (!name.matches("[a-zA-Z0-9._-]{1,249}") || name.equals(".") || name.equals("..")) {
-            throw new IllegalArgumentException("必须配置单个合法的Kafka主题名");
+            throw new IllegalArgumentException("非法Kafka主题名: " + name);
         }
         return name;
     }

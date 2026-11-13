@@ -40,7 +40,6 @@ class PackagedIgniteIT {
             java.util.List<String> command = new java.util.ArrayList<>(java.util.Arrays.asList(
                     Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
                     "-Dheartbeat.collector.status.max.bytes=1",
-                    "-Dheartbeat.collector.status.backup.count=0",
                     "-cp", Paths.get("target/heartbeat-reader-0.1.0.jar").toAbsolutePath().toString(),
                     HeartbeatLogCollector.class.getName(), "--rest-url", "http://127.0.0.1:" + server.getAddress().getPort(),
                     "--application-id", "application_1_1", "--output-dir", output.toString()));
@@ -58,7 +57,12 @@ class PackagedIgniteIT {
                         Thread.sleep(50);
                     }
                     assertTrue(Files.readString(status).contains("collected=1"), Files.readString(log));
-                    assertFalse(Files.exists(status.resolveSibling(status.getFileName() + ".1")));
+                    try (java.util.stream.Stream<Path> files = Files.list(output)) {
+                        java.util.List<Path> archived = files.filter(path -> path.getFileName().toString()
+                                .startsWith(status.getFileName() + ".")).collect(java.util.stream.Collectors.toList());
+                        assertEquals(1, archived.size());
+                        assertEquals("previous status\n", Files.readString(archived.get(0)));
+                    }
                 }
                 assertTrue(Files.readString(output.resolve("heartbeat-monitor-application_1_1.log")).contains("committed=10"));
             } finally {

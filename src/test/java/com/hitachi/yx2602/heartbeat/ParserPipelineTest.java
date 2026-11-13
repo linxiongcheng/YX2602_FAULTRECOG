@@ -21,6 +21,42 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class ParserPipelineTest {
     @Test @Timeout(90)
+    void threeTopicValidAndErrorRecordsRetainTheirSourceThroughTheSharedPipeline() throws Exception {
+        long now = System.currentTimeMillis();
+        String date = java.time.format.DateTimeFormatter.ofPattern("uuuu/M/d H:mm:ss.SSS")
+                .withZone(java.time.ZoneId.of("Asia/Shanghai")).format(java.time.Instant.ofEpochMilli(now - 1000));
+        List<RawHeartbeat> input = new ArrayList<>();
+        for (int i = 1; i <= 3; i++) {
+            String prefix = "{\"CreatedDate\":\"" + date + "\",\"EId1\":";
+            for (String json : Arrays.asList(prefix + (200 + i) + "}", "{}", prefix + (300 + i) + ",\"Floor1\":\"bad\"}")) {
+                input.add(new RawHeartbeat(json.getBytes(java.nio.charset.StandardCharsets.UTF_8), null,
+                        "heartbeat" + i, 0, input.size(), now));
+            }
+        }
+        Properties p = ReaderConfigTest.properties();
+        p.setProperty("kafka.input.topic", "heartbeat1,heartbeat2,heartbeat3");
+        p.setProperty("parallelism", "1"); p.setProperty("monitor.log.interval.ms", "0");
+        ReaderConfig config = ReaderConfig.from(p, key -> null);
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
+        org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator<HeartbeatMessage> validated =
+                env.fromCollection(input).process(new HeartbeatReader.ValidationFunction(60000, 0));
+        HeartbeatParser.Streams streams = HeartbeatParser.transform(validated, config);
+        DataStream<String> all = streams.valid.map(ElevatorUpdate::toString)
+                .union(validated.getSideOutput(HeartbeatReader.ValidationFunction.ERRORS), streams.errors);
+        List<JsonNode> results = new ArrayList<>();
+        ObjectMapper mapper = new ObjectMapper();
+        try (CloseableIterator<String> iterator = all.executeAndCollect()) {
+            while (iterator.hasNext()) results.add(mapper.readTree(iterator.next()));
+        }
+        assertEquals(9, results.size());
+        for (int i = 1; i <= 3; i++) {
+            String topic = "heartbeat" + i;
+            assertEquals(1, results.stream().filter(row -> topic.equals(row.path("sourceTopic").asText())).count());
+            assertEquals(2, results.stream().filter(row -> topic.equals(row.path("source").path("topic").asText())).count());
+        }
+    }
+    @Test @Timeout(90)
     void realFlinkRuntimeSplitsRoutesAndOrders() throws Exception {
         long now = System.currentTimeMillis();
         Properties properties = ReaderConfigTest.properties();

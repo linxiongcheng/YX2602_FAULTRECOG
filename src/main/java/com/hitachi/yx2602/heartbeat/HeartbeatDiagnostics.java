@@ -27,7 +27,7 @@ final class HeartbeatDiagnostics implements AutoCloseable {
     private final Map<String, LongAdder> counts = new ConcurrentHashMap<>();
     private final Map<String, Timing> timings = new ConcurrentHashMap<>();
     private final Map<String, LongSupplier> gauges = new ConcurrentHashMap<>();
-    private final Map<Integer, AtomicLong> offsets = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> offsets = new ConcurrentHashMap<>();
     private ScheduledExecutorService scheduler;
     private long previousSnapshot;
 
@@ -100,7 +100,15 @@ final class HeartbeatDiagnostics implements AutoCloseable {
     void gauge(String name, LongSupplier value) { if (intervalMs != 0) gauges.put(name, value); }
 
     void observedOffset(int partition, long offset) {
-        if (intervalMs != 0) offsets.computeIfAbsent(partition, key -> new AtomicLong()).set(offset);
+        observedOffsetKey("observed_offset_p" + partition, offset);
+    }
+
+    void observedOffset(String topic, int partition, long offset) {
+        observedOffsetKey("observed_offset_" + topic + "_p" + partition, offset);
+    }
+
+    private void observedOffsetKey(String key, long offset) {
+        if (intervalMs != 0) offsets.computeIfAbsent(key, ignored -> new AtomicLong()).set(offset);
     }
 
     void checkpoint(String event, long checkpointId) {
@@ -131,8 +139,7 @@ final class HeartbeatDiagnostics implements AutoCloseable {
                     .append(active == Long.MIN_VALUE ? 0 : TimeUnit.NANOSECONDS.toMillis(Math.max(0, now - active)));
         });
         new TreeMap<>(gauges).forEach((name, gauge) -> line.append(' ').append(name).append('=').append(gauge.getAsLong()));
-        new TreeMap<>(offsets).forEach((partition, value) -> line.append(" observed_offset_p")
-                .append(partition).append('=').append(value.get()));
+        new TreeMap<>(offsets).forEach((key, value) -> line.append(' ').append(key).append('=').append(value.get()));
         return line.toString();
     }
 

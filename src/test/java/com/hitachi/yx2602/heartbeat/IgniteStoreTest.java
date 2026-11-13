@@ -572,8 +572,10 @@ class IgniteStoreTest {
         assertTrue(plan.contains(IgniteHeartbeatStore.Schema.CREATED_DATE_INDEX), plan);
     }
 
-    @Test void startupRecreatesMissingIndexButReadOnlyCheckDoesNot() {
-        query("DROP INDEX PUBLIC.IDX_HB_STATE_CREATEDDATE");
+    @ParameterizedTest
+    @ValueSource(strings = {"IDX_HB_STATE_CREATEDDATE", "IDX_HB_STATE_EID", "IDX_HB_STATE_INTID"})
+    void startupRecreatesMissingIndexButReadOnlyCheckDoesNot(String index) {
+        query("DROP INDEX PUBLIC." + index);
         try {
             assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings, false));
         } finally {
@@ -582,16 +584,42 @@ class IgniteStoreTest {
         try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings, false)) { }
     }
 
-    @Test void incorrectNamedIndexIsRejectedWithoutBeingSilentlyReplaced() {
-        query("DROP INDEX PUBLIC.IDX_HB_STATE_CREATEDDATE");
-        query("CREATE INDEX IDX_HB_STATE_CREATEDDATE ON PUBLIC.HB_STATE(UPDATEDDATE)");
+    @ParameterizedTest
+    @ValueSource(strings = {"IDX_HB_STATE_CREATEDDATE", "IDX_HB_STATE_EID", "IDX_HB_STATE_INTID"})
+    void incorrectNamedIndexIsRejectedWithoutBeingSilentlyReplaced(String index) {
+        query("DROP INDEX PUBLIC." + index);
+        query("CREATE INDEX " + index + " ON PUBLIC.HB_STATE(UPDATEDDATE)");
         try {
             assertThrows(IllegalStateException.class, () -> new IgniteHeartbeatStore(settings));
-            assertTrue(query("SELECT COLUMNS FROM SYS.INDEXES WHERE INDEX_NAME='IDX_HB_STATE_CREATEDDATE'")
+            assertTrue(query("SELECT COLUMNS FROM SYS.INDEXES WHERE INDEX_NAME=?", index)
                     .toString().contains("UPDATEDDATE"));
         } finally {
-            query("DROP INDEX PUBLIC.IDX_HB_STATE_CREATEDDATE");
+            query("DROP INDEX PUBLIC." + index);
             try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings)) { }
+        }
+    }
+
+    @Test void identifierIndexesSupportLookupsAndCanBeAddedWithoutLosingRows() throws Exception {
+        ElevatorUpdate first = update(9001, 1000, 1), second = update(9002, 2000, 1);
+        first.state.intId = 8888L; second.state.intId = 9999L;
+        try (IgniteHeartbeatStore store = new IgniteHeartbeatStore(settings)) {
+            store.write(rows(first, second));
+        }
+        query("DROP INDEX PUBLIC.IDX_HB_STATE_EID");
+        query("DROP INDEX PUBLIC.IDX_HB_STATE_INTID");
+        try (IgniteHeartbeatStore ignored = new IgniteHeartbeatStore(settings)) { }
+        assertEquals(4L, query("SELECT COUNT(*) FROM HB_STATE").get(0).get(0));
+        assertEquals(Collections.singletonList(Collections.singletonList(8888L)),
+                query("SELECT INTID FROM HB_STATE WHERE EID=9001 AND SLOT=-1"));
+        assertEquals(Collections.singletonList(Collections.singletonList(9002L)),
+                query("SELECT EID FROM HB_STATE WHERE INTID=9999 AND SLOT=-1"));
+        String plan = query("EXPLAIN SELECT EID FROM HB_STATE WHERE INTID=9999").toString();
+        assertTrue(plan.contains(IgniteHeartbeatStore.Schema.INT_ID_INDEX), plan);
+        for (String[] index : new String[][]{{IgniteHeartbeatStore.Schema.EID_INDEX, "EID"},
+                {IgniteHeartbeatStore.Schema.INT_ID_INDEX, "INTID"}}) {
+            String columns = String.valueOf(query("SELECT COLUMNS FROM SYS.INDEXES WHERE CACHE_NAME='HB_STATE' AND INDEX_NAME=?",
+                    index[0]).get(0).get(0));
+            assertTrue(columns.startsWith("\"" + index[1] + "\" ASC"), columns);
         }
     }
 
@@ -685,6 +713,39 @@ class IgniteStoreTest {
         env.execute("heartbeat-ignite-integration");
         assertEquals(2L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT=-1").get(0).get(0));
         assertEquals(3L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT>=0").get(0).get(0));
+    }
+
+    @Test void threeTopicMessagesShareParserOrderingAndTheSameIgniteTable() throws Exception {
+        java.util.Properties p = ReaderConfigTest.properties();
+        p.setProperty("kafka.input.topic", "heartbeat1,heartbeat2,heartbeat3");
+        p.setProperty("parallelism", "2");
+        p.setProperty("monitor.log.interval.ms", "0");
+        ReaderConfig config = ReaderConfig.from(p, key -> null);
+        long now = System.currentTimeMillis();
+        java.time.format.DateTimeFormatter format = java.time.format.DateTimeFormatter
+                .ofPattern("uuuu/M/d H:mm:ss.SSS").withZone(java.time.ZoneId.of("Asia/Shanghai"));
+        List<RawHeartbeat> raw = new ArrayList<>();
+        for (int i = 1; i <= 3; i++) {
+            String value = "{\"CreatedDate\":\"" + format.format(java.time.Instant.ofEpochMilli(now - 4000 + i * 1000))
+                    + "\",\"EId1\":" + (6000 + i) + ",\"Floor1\":" + i
+                    + ",\"EId2\":6999,\"Floor2\":" + i + "}";
+            raw.add(new RawHeartbeat(value.getBytes(java.nio.charset.StandardCharsets.UTF_8), null,
+                    "heartbeat" + i, 0, i, now));
+        }
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(2);
+        org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator<HeartbeatMessage> valid =
+                env.fromCollection(raw).process(new HeartbeatReader.ValidationFunction(60000, 0));
+        IgniteHeartbeatSink.attach(HeartbeatParser.transform(valid, config).valid, settings);
+        env.execute("multi-topic-to-shared-ignite");
+        assertEquals(4L, query("SELECT COUNT(*) FROM HB_STATE WHERE SLOT=-1").get(0).get(0));
+        for (int i = 1; i <= 3; i++) {
+            assertEquals(Arrays.asList("heartbeat" + i, (long) i),
+                    query("SELECT SOURCE_TOPIC, FLOOR FROM HB_STATE WHERE EID=? AND SLOT=-1", 6000L + i).get(0));
+        }
+        assertEquals(Arrays.asList("heartbeat3", 3L),
+                query("SELECT SOURCE_TOPIC, FLOOR FROM HB_STATE WHERE EID=6999 AND SLOT=-1").get(0));
+        assertEquals(1L, query("SELECT COUNT(*) FROM HB_STATE WHERE EID=6999 AND SLOT=-1").get(0).get(0));
     }
 
     @Test void databaseOutageFailsCheckpointAndRestoredSinkReplaysSafely() throws Exception {

@@ -2,6 +2,8 @@
 
 2026-11-05增加周期性性能日志，用于区分读取到旧消息、解析计算耗时、向下游输出等待、入队等待，以及Ignite读取/批量写入/提交耗时。日志是客户端观测，网络、服务端锁和磁盘等待需要结合服务器监控判断。业务规则、表结构、算子UID和Flink状态结构沿用当前单表作业。
 
+2026-11-13增加 [自动性能统计命令](heartbeat-performance-report.md)：读取现有汇总日志，按全部已覆盖子任务汇总吞吐、加权耗时、过滤及失败计数、队列和检查点刷写等待，支持当前窗口、历史回看及每30秒刷新。无需重新提交Flink业务作业。
+
 ## 开启与升级
 
 切换到纯内存窗口时，以 [内存模式部署说明](ignite-memory.md) 的新组、无Savepoint启动流程为准。下面的保存点升级流程适用于仅更新监控、需要保留Flink处理进度的场景。
@@ -38,9 +40,9 @@ logger.heartbeatPerf.level = INFO
 | 文件 | 内容 |
 | --- | --- |
 | `heartbeat-monitor.log` | 指向最近启动Application监控文件的便捷链接；已有同名普通文件时保留原文件 |
-| `heartbeat-monitor-application_实际ID.log` | 各TaskManager性能摘要及检查点事件；默认30MiB上限、达到后清空旧内容、不留备份 |
-| `collector-application_实际ID.log` | 汇总进程状态及错误重试；默认10MiB上限、达到后清空旧内容、不留备份 |
-| `collector-application_实际ID.log.bootstrap` | JVM启动/未捕获异常输出，每次启动采集器覆盖；正常运行摘要写入上面的状态日志 |
+| `heartbeat-monitor-application_实际ID.log` | 各TaskManager性能摘要及检查点事件；默认30MiB分段，跨天滚动，保留最近7个自然日 |
+| `collector-application_实际ID.log` | 汇总进程状态及错误重试；默认10MiB分段，跨天滚动，保留最近7个自然日 |
+| `collector-application_实际ID.log.bootstrap` | 指向本次带日期与进程号的JVM启动/未捕获异常日志；不覆盖前次输出 |
 | `submit-日期时间-进程号.log` | 本次Flink提交输出及Application ID |
 | `collector-application_实际ID.pid` | 提交节点汇总进程的PID |
 | `.heartbeat-monitor-application_实际ID.offsets.json` | 事件去重位置，供汇总进程重启接续 |
@@ -49,7 +51,7 @@ logger.heartbeatPerf.level = INFO
 
 容器独立文件位于 `-Dlog.file` 对应的TaskManager日志目录，名为 `heartbeat-monitor.log`，约256KiB轮转并保留上一份。Flink REST日志接口需能访问该目录，标准YARN布局下它与普通TaskManager日志位于同一目录。日志携带进程唯一事件ID和递增序号，汇总时按ID去重，事件时间使用北京时间。最终目录在运行启动脚本的提交节点，不要求各YARN节点共享项目目录。
 
-2026-11-10增加提交节点日志大小限制及旧备份自动淘汰；详见 [日志轮转与不停作业更新](log-retention.md)。默认每个Application的监控与状态日志合计约40MiB（30MiB监控＋10MiB状态，均无备份），不含bootstrap、提交输出及去重状态。不同Application的日志独立保留，不自动清理整个logs目录。文件清空不改变去重位置，不影响业务窗口或Kafka位点；持续查看应使用 `tail -F`。
+2026-11-13更新为按日和大小分段续写，保留当天及前6天；超过30MiB不会清空监控，而是封存到 `.log.日期.编号` 并新建当前文件。目录按7天期限清理旧Application的项目日志，保留运行与去重状态；总大小不再是每应用40MiB上限。清理范围、独立清理脚本及不停作业更新详见 [日志保留规则](log-retention.md)。持续查看仍使用 `tail -F`。
 
 首批摘要产生并被轮询后（通常约30～60秒），直接查看最近启动作业：
 
@@ -181,7 +183,7 @@ commit_samples=240 commit_total_ms=7200.000 commit_avg_ms=30.000 commit_max_ms=1
 
 性能摘要中的 `checkpoint_flush` 提供对应等待耗时和active；`checkpoint_flush_ok/failed` 提供窗口结果计数。completed通知不等同于Kafka位点提交请求已被Broker确认，需要对照KafkaSource已有的currentOffset/committedOffset指标或消费组查询。
 
-`observed_offset_pN` 是校验阶段最后观察到的原始消息offset，不是Kafka末尾，不是提交位置，也不证明该消息已经写入Ignite。Kafka的CURRENT-OFFSET通常表示下一条位置，与原始消息offset有1的计数差异。摘要不额外轮询Broker，不单独声明真实LAG；需要与KafkaSource和Broker同一分区的位点比较。
+`observed_offset_<topic>_pN` 是校验阶段最后观察到的原始消息offset，包含Topic以区分多个Topic的同号分区；旧日志使用 `observed_offset_pN`。这些位点不是Kafka末尾或提交位置，也不证明该消息已经写入Ignite。Kafka的CURRENT-OFFSET通常表示下一条位置，与原始消息offset有1的计数差异。摘要不额外轮询Broker，不单独声明真实LAG；需要与KafkaSource和Broker同一Topic同一分区的位点比较。
 
 若客户端日志定位到写入等待，继续在Ignite宿主机关联同一时间段的 `pidstat -d`、`iostat -x`、容器CPU/内存，以及服务端日志。现有数据目录和磁盘记录见 [Ignite实际持久化目录](heartbeat-ignite.md#ignite实际持久化目录)。
 

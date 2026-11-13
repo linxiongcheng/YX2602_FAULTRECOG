@@ -70,3 +70,7 @@ CREATE TABLE IF NOT EXISTS PUBLIC.HB_STATE (
 
 -- Supports CreatedDate ranges across elevators; use SLOT=-1 for latest state or SLOT>=0 for history.
 CREATE INDEX IF NOT EXISTS IDX_HB_STATE_CREATEDDATE ON PUBLIC.HB_STATE (CREATEDDATE);
+
+-- Explicit lookup indexes requested for elevator and source identifiers.
+CREATE INDEX IF NOT EXISTS IDX_HB_STATE_EID ON PUBLIC.HB_STATE (EID);
+CREATE INDEX IF NOT EXISTS IDX_HB_STATE_INTID ON PUBLIC.HB_STATE (INTID);

@@ -34,7 +34,7 @@ done
 /opt/java11/bin/java -version
 log_dir=/home/xiong/projects/YX2602_FAULTRECOG/logs
 mkdir -p "$log_dir"
-submission_log="$log_dir/submit-$(date +%Y%m%d-%H%M%S)-$$.log"
+submission_log="$log_dir/submit-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)-$$.log"
 printf '%s\n' 'Submitting yx2602-heartbeat-storage to YARN. Keep the Application ID and Tracking URL printed below.'
 if [[ "${#restore_args[@]}" != 0 ]]; then
   printf 'Restoring Flink state and Kafka positions from: %s\n' "${restore_args[1]}"

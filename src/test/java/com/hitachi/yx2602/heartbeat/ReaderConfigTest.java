@@ -38,6 +38,24 @@ class ReaderConfigTest {
         assertThrows(IllegalArgumentException.class, () -> ReaderConfig.from(p, key -> null));
     }
 
+    @Test void supportsThreeInputTopicsAndRetainsSingleTopicCompatibility() {
+        Properties p = properties();
+        assertEquals(java.util.Collections.singletonList("heartbeat-test"), ReaderConfig.from(p, key -> null).inputTopics);
+        p.setProperty("kafka.input.topic", " heartbeat1, heartbeat2 , heartbeat3 ");
+        ReaderConfig config = ReaderConfig.from(p, key -> null);
+        assertEquals(java.util.Arrays.asList("heartbeat1", "heartbeat2", "heartbeat3"), config.inputTopics);
+        assertThrows(UnsupportedOperationException.class, () -> config.inputTopics.add("other"));
+        p.setProperty("kafka.error.topic", "heartbeat2");
+        assertThrows(IllegalArgumentException.class, () -> ReaderConfig.from(p, key -> null));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"heartbeat1,", ",heartbeat1", "heartbeat1,,heartbeat3", "heartbeat1, heartbeat1", "heartbeat1, bad name", "heartbeat1,.."})
+    void rejectsMalformedInputLists(String value) {
+        Properties p = properties(); p.setProperty("kafka.input.topic", value);
+        assertThrows(IllegalArgumentException.class, () -> ReaderConfig.from(p, key -> null));
+    }
+
     @Test void expandsEnvironmentWithoutCorruptingJaasEscapes() {
         Properties p = properties();
         p.setProperty("kafka.client.sasl.jaas.config", "${JAAS}");

@@ -27,17 +27,18 @@ public final class HeartbeatLogCollector {
     private static final Pattern EVENT = Pattern.compile("event_id=([a-f0-9-]+):([0-9]+) ");
     private final String baseUrl;
     private final Path output, state;
-    private final RollingFile monitorLog;
+    private final HeartbeatLogFiles.DailyLog monitorLog;
+    private final HeartbeatLogFiles.Cleaner cleaner;
     private final Map<String, Long> positions = new LinkedHashMap<>();
 
     HeartbeatLogCollector(String baseUrl, String applicationId, Path directory) throws IOException {
         this(baseUrl, applicationId, directory,
                 longProperty("heartbeat.collector.monitor.max.bytes", 30L * 1024 * 1024),
-                backupProperty("heartbeat.collector.monitor.backup.count", 0));
+                HeartbeatLogFiles.retentionDays());
     }
 
     HeartbeatLogCollector(String baseUrl, String applicationId, Path directory,
-                          long maxBytes, int backups) throws IOException {
+                          long maxBytes, int retentionDays) throws IOException {
         URI uri = URI.create(baseUrl);
         if (!("http".equals(uri.getScheme()) || "https".equals(uri.getScheme())) || uri.getHost() == null
                 || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
@@ -47,18 +48,25 @@ public final class HeartbeatLogCollector {
         this.baseUrl = baseUrl.replaceAll("/+$", "");
         Files.createDirectories(directory);
         output = directory.resolve("heartbeat-monitor-" + applicationId + ".log");
-        monitorLog = new RollingFile(output, maxBytes, backups);
+        monitorLog = new HeartbeatLogFiles.DailyLog(output, maxBytes);
+        cleaner = new HeartbeatLogFiles.Cleaner(directory, retentionDays);
         state = directory.resolve(".heartbeat-monitor-" + applicationId + ".offsets.json");
-        if (Files.exists(state) && (Files.exists(output) || Files.exists(monitorLog.backup(1)))) {
+        if (Files.exists(state)) {
             JsonNode saved = JSON.readTree(Files.readAllBytes(state));
             saved.fields().forEachRemaining(entry -> positions.put(entry.getKey(), entry.getValue().asLong()));
         }
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 3 && args[0].equals("--cleanup-logs") && args[1].equals("--output-dir")) {
+            System.out.println("removed_log_files=" + new HeartbeatLogFiles.Cleaner(
+                    Paths.get(args[2]), HeartbeatLogFiles.retentionDays()).clean());
+            return;
+        }
         if ((args.length != 6 && args.length != 7) || !args[0].equals("--rest-url") || !args[2].equals("--application-id")
                 || !args[4].equals("--output-dir") || (args.length == 7 && !args[6].equals("--once"))) {
-            throw new IllegalArgumentException("Usage: --rest-url URL --application-id ID --output-dir DIRECTORY [--once]");
+            throw new IllegalArgumentException("Usage: --rest-url URL --application-id ID --output-dir DIRECTORY [--once]"
+                    + " or --cleanup-logs --output-dir DIRECTORY");
         }
         HeartbeatLogCollector collector = new HeartbeatLogCollector(args[1], args[3], Paths.get(args[5]));
         Path lockPath = collector.state.resolveSibling(collector.state.getFileName() + ".lock");
@@ -68,13 +76,22 @@ public final class HeartbeatLogCollector {
             if (lock == null) throw new IllegalStateException("A collector already owns this application log");
             if (args.length == 7) {
                 System.out.println("collected=" + collector.collectOnce());
+                collector.cleaner.clean();
                 return;
             }
-            RollingFile statusLog = new RollingFile(Paths.get(args[5]).resolve("collector-" + args[3] + ".log"),
-                    longProperty("heartbeat.collector.status.max.bytes", 10L * 1024 * 1024),
-                    backupProperty("heartbeat.collector.status.backup.count", 0));
+            HeartbeatLogFiles.DailyLog statusLog = new HeartbeatLogFiles.DailyLog(Paths.get(args[5]).resolve("collector-" + args[3] + ".log"),
+                    longProperty("heartbeat.collector.status.max.bytes", 10L * 1024 * 1024));
             int failures = 0;
             while (!Thread.currentThread().isInterrupted() && failures < 10) {
+                try {
+                    collector.monitorLog.rollForToday();
+                    statusLog.rollForToday();
+                    int removed = collector.cleaner.cleanIfDue();
+                    if (removed > 0) statusLog.append(Instant.now() + " removed_log_files=" + removed);
+                } catch (IOException cleanup) {
+                    // Cleanup trouble must not stop collection of new diagnostics.
+                    statusLog.append(Instant.now() + " cleanup_error=" + cleanup.getMessage());
+                }
                 try {
                     int added = collector.collectOnce();
                     failures = 0;
@@ -91,6 +108,7 @@ public final class HeartbeatLogCollector {
     }
 
     int collectOnce() throws IOException {
+        monitorLog.rollForToday();
         byte[] listing = get("/taskmanagers", 1024 * 1024);
         if (listing == null) throw new IOException("TaskManager list unavailable");
         JsonNode managers = JSON.readTree(listing).path("taskmanagers");
@@ -153,53 +171,6 @@ public final class HeartbeatLogCollector {
         long value = Long.parseLong(System.getProperty(name, Long.toString(defaultValue)));
         if (value <= 0) throw new IllegalArgumentException(name + " must be positive");
         return value;
-    }
-
-    private static int backupProperty(String name, int defaultValue) {
-        long value = Long.parseLong(System.getProperty(name, Integer.toString(defaultValue)));
-        if (value < 0 || value > 100) throw new IllegalArgumentException(name + " must be 0..100");
-        return (int) value;
-    }
-
-    /** Single collector owns these files under its application lock; no persistent open handles. */
-    static final class RollingFile {
-        private final Path file;
-        private final long maxBytes;
-        private final int backups;
-        private boolean cleanupPending = true;
-
-        RollingFile(Path file, long maxBytes, int backups) {
-            if (maxBytes <= 0 || backups < 0 || backups > 100) {
-                throw new IllegalArgumentException("Log max bytes must be positive; backups must be 0..100");
-            }
-            this.file = file; this.maxBytes = maxBytes; this.backups = backups;
-        }
-
-        Path backup(int number) { return file.resolveSibling(file.getFileName() + "." + number); }
-
-        void append(String line) throws IOException {
-            byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
-            if (cleanupPending) {
-                // Only this application's reserved numbered backups, under its collector lock.
-                for (int i = backups + 1; i <= 100; i++) Files.deleteIfExists(backup(i));
-                cleanupPending = false;
-            }
-            long size = Files.exists(file) ? Files.size(file) : 0;
-            if (size > 0 && (size >= maxBytes || bytes.length > maxBytes - size)) {
-                if (backups == 0) {
-                    Files.write(file, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                    return;
-                }
-                for (int i = backups - 1; i >= 1; i--) {
-                    if (Files.exists(backup(i))) {
-                        Files.move(backup(i), backup(i + 1), StandardCopyOption.REPLACE_EXISTING);
-                    }
-                }
-                Files.move(file, backup(1), StandardCopyOption.REPLACE_EXISTING);
-            }
-            // Keep complete records even if a single unusually long line exceeds the limit.
-            Files.write(file, bytes, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-        }
     }
 
     private void savePositions() throws IOException {

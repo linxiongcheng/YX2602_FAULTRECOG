@@ -2,6 +2,8 @@
 
 Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式校验、分梯、字段规范化、10分钟过期过滤及按电梯判断新旧，输出带历史序号的单梯状态。读取和解析异常都可靠写入配置的异常Topic。解析规则与字段映射详见 [解析模块说明](docs/heartbeat-parser.md)。正式写入与部署详见 [Ignite 模块说明](docs/heartbeat-ignite.md)。
 
+输入支持 `kafka.input.topic=heartbeat1,heartbeat2,heartbeat3`，原单Topic配置仍兼容。三个Topic共用解析链路及HB_STATE，同EID跨Topic统一判断新旧；异常沿用kafka.error.topic并保留来源。首次扩大订阅范围按 [三Topic统一消费](docs/multi-topic-heartbeat.md) 上线。
+
 当前采用 **Ignite纯内存心跳窗口**：使用服务端默认数据区域且 `persistenceEnabled=false`，允许RANDOM_2_LRU淘汰最新及历史记录；丢失窗口由后续有效心跳逐步重新建立，不做历史窗口恢复。正式作业自动创建不存在的空表，既有旧表不会自动迁移或删除。首次切换及后续内存服务重启按 [内存模式部署说明](docs/ignite-memory.md) 执行。
 
 旧表改为查询无需引号的结构，按 [清空重建与重新部署](docs/redeploy-unquoted-columns.md) 执行。
@@ -14,9 +16,11 @@ Java 11 / Flink 1.20.5 / Ignite 2.18.0 实现。读取Kafka心跳，完成格式
 
 定位积压：新版默认每30秒输出读取校验、分梯解析、新旧判断、Ignite写入的性能摘要，分别统计纯计算、输出等待、入队和读写/提交耗时；配置与日志判读见 [性能日志与积压定位](docs/heartbeat-monitoring.md)。
 
+消费、解析、写入的自动统计：`bash bin/report-heartbeat-performance.sh --simple` 显示最近60分钟的消费、解析和写入平均/最高吞吐，追加 `--watch` 每30秒刷新。统计独立于业务作业，指标口径及历史回看见 [性能统计报告](docs/heartbeat-performance-report.md)。
+
 新版启动脚本自动将各TaskManager监控日志汇总到提交节点 `/home/xiong/projects/YX2602_FAULTRECOG/logs/heartbeat-monitor-<ApplicationID>.log`。需同步更新JAR和两个脚本，通过Flink现有REST接口读取，不依赖YARN运行期日志聚合。
 
-提交节点日志自动按大小清理：监控文件上限30MiB、采集器状态文件上限10MiB，均不保留备份，达到上限后清空当前文件旧内容并继续写新日志。支持仅重启采集器更新，参数及步骤见 [日志保留规则](docs/log-retention.md)。
+提交节点日志按大小及北京时间日期滚动：监控每段30MiB、采集器状态每段10MiB，保留当天及前6天的所有段，自动清理更早的项目日志（含旧Application），不再满额清空。支持仅重启采集器更新，参数及步骤见 [日志保留规则](docs/log-retention.md)。
 
 ## 实现范围
 
