@@ -3,12 +3,34 @@ set -eo pipefail
 
 # Fixed paths for the cluster submission node. Run with Bash from any directory.
 restore_args=()
-if [[ "$#" == 2 && ( "$1" == "--from-savepoint" || "$1" == "-s" ) && -n "$2" && "$2" != -* ]]; then
-  restore_args=(-s "$2")
-elif [[ "$#" != 0 ]]; then
-  printf '%s\n' 'Usage: bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh [--from-savepoint PATH]' >&2
-  exit 2
-fi
+job_name_args=()
+application_name=yx2602-heartbeat-storage
+usage() {
+  printf '%s\n' 'Usage: bash /home/xiong/projects/YX2602_FAULTRECOG/bin/start-heartbeat.sh [--job-name NAME] [--from-savepoint PATH]' >&2
+}
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --job-name)
+      if [[ "$#" -lt 2 || "${#job_name_args[@]}" != 0 || -z "${2//[[:space:]]/}" || "$2" == -* \
+            || "$2" =~ ^[[:space:]] || "$2" =~ [[:space:]]$ || "$2" == *$'\n'* || "$2" == *$'\r'* ]]; then
+        usage
+        exit 2
+      fi
+      application_name="$2"
+      job_name_args=(--job-name "$2")
+      shift 2
+      ;;
+    --from-savepoint|-s)
+      if [[ "$#" -lt 2 || "${#restore_args[@]}" != 0 || -z "$2" || "$2" == -* ]]; then
+        usage
+        exit 2
+      fi
+      restore_args=(-s "$2")
+      shift 2
+      ;;
+    *) usage; exit 2 ;;
+  esac
+done
 
 for required_file in \
   /opt/flink-1.20.5/conf/cdh-env.sh \
@@ -35,7 +57,7 @@ done
 log_dir=/home/xiong/projects/YX2602_FAULTRECOG/logs
 mkdir -p "$log_dir"
 submission_log="$log_dir/submit-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)-$$.log"
-printf '%s\n' 'Submitting yx2602-heartbeat-storage to YARN. Keep the Application ID and Tracking URL printed below.'
+printf 'Submitting %s to YARN. Keep the Application ID and Tracking URL printed below.\n' "$application_name"
 if [[ "${#restore_args[@]}" != 0 ]]; then
   printf 'Restoring Flink state and Kafka positions from: %s\n' "${restore_args[1]}"
 fi
@@ -47,7 +69,7 @@ set +e
   -Dcontainerized.master.env.JAVA_HOME=/opt/java11 \
   -Dcontainerized.taskmanager.env.JAVA_HOME=/opt/java11 \
   '-Denv.java.opts.all=--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED' \
-  -Dyarn.application.name=yx2602-heartbeat-storage \
+  "-Dyarn.application.name=$application_name" \
   -Djobmanager.memory.process.size=1024m \
   -Dtaskmanager.memory.process.size=2048m \
   -Dtaskmanager.numberOfTaskSlots=2 \
@@ -56,7 +78,7 @@ set +e
   -c com.hitachi.yx2602.heartbeat.HeartbeatReaderJob \
   "${restore_args[@]}" \
   /home/xiong/projects/YX2602_FAULTRECOG/target/heartbeat-reader-0.1.0.jar \
-  --config local.properties --run 2>&1 | tee "$submission_log"
+  --config local.properties --run "${job_name_args[@]}" 2>&1 | tee "$submission_log"
 submission_status=("${PIPESTATUS[@]}")
 set -e
 if [[ "${submission_status[0]}" != 0 ]]; then
